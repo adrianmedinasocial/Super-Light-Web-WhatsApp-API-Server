@@ -861,10 +861,11 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
                 results.push({ status: 'error', message: 'Invalid message format. "to" and "type" are required.' });
                 continue;
             }
-            if (!validator.isNumeric(to) && !to.endsWith('@g.us')) {
-                results.push({ status: 'error', message: 'Invalid recipient format.' });
-                continue;
-            }
+// ✅ MODIFICATION 1: Allow @lid in validation
+if (!validator.isNumeric(to) && !to.endsWith('@g.us') && !to.endsWith('@lid')) {
+    results.push({ status: 'error', message: 'Invalid recipient format.' });
+    continue;
+}
             
             // Add phone number to the list for logging
             phoneNumbers.push(to);
@@ -914,11 +915,17 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
             messageContents.push(messageContent);
 
             let destination;
-            if (recipient_type === 'group') {
-                destination = to.endsWith('@g.us') ? to : `${to}@g.us`;
-            } else {
-                destination = `${to.replace(/[@s.whatsapp.net]/g, '')}@s.whatsapp.net`;
-            }
+if (recipient_type === 'group') {
+    destination = to.endsWith('@g.us') ? to : `${to}@g.us`;
+} else {
+    // ✅ MODIFICATION 2: If it's a LID, use it as is. Otherwise, format as phone number.
+    if (to.endsWith('@lid')) {
+        destination = to;
+    } else {
+        // Original logic for standard phone numbers
+        destination = `${to.replace(/[@s.whatsapp.net]/g, '')}@s.whatsapp.net`;
+    }
+}
 
             let messagePayload;
             let options = {};
