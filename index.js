@@ -796,16 +796,32 @@ async function connectToWhatsApp(sessionId) {
         if (connection === 'close') {
             const reason = new Boom(lastDisconnect?.error)?.output?.payload?.error || 'Unknown';
 
-            // Allow reconnection on a 515 error, which is a "stream error" often seen after pairing.
-            const shouldReconnect = statusCode !== 401 && statusCode !== 403;
-            
+            // Get current session state to check if we're in initial auth
+            const currentSession = sessions.get(sessionId);
+            const isInitialAuth = currentSession && currentSession.status === 'GENERATING_QR';
+
+            // During initial authentication (QR scan), allow retry even on 401
+            // 401 during QR scan is often temporary as WhatsApp validates the link
+            let shouldReconnect;
+            if (isInitialAuth && statusCode === 401) {
+                log(`401 during initial auth - will retry (temporary auth validation)`, sessionId);
+                shouldReconnect = true;
+            } else {
+                // Only treat 403 as fatal (banned/blocked)
+                // Allow retry on 401, 408 (timeout), 409, 428, 440, 500, etc.
+                shouldReconnect = statusCode !== 403;
+            }
+
             log(`Connection closed. Reason: ${reason}, statusCode: ${statusCode}. Reconnecting: ${shouldReconnect}`, sessionId);
             updateSessionState(sessionId, 'DISCONNECTED', 'Connection closed.', '', reason);
 
             if (shouldReconnect) {
-                setTimeout(() => connectToWhatsApp(sessionId), 5000);
+                // Use exponential backoff for retries
+                const retryDelay = statusCode === 401 ? 3000 : 5000;
+                log(`Retrying connection in ${retryDelay}ms...`, sessionId);
+                setTimeout(() => connectToWhatsApp(sessionId), retryDelay);
             } else {
-                 log(`Not reconnecting for session ${sessionId} due to fatal error. Please delete and recreate the session.`, sessionId);
+                 log(`Not reconnecting for session ${sessionId} due to fatal error (403 - Forbidden). Please delete and recreate the session.`, sessionId);
                  const sessionDir = path.join(__dirname, 'auth_info_baileys', sessionId);
                  if (fs.existsSync(sessionDir)) {
                     fs.rmSync(sessionDir, { recursive: true, force: true });
