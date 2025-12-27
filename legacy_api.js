@@ -3,7 +3,6 @@ const multer = require('multer');
 const { jidNormalizedUser } = require('@whiskeysockets/baileys');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('validator');
-const { validateToken } = require('./api_v1');
 
 const router = express.Router();
 const upload = multer(); // for form-data parsing
@@ -32,9 +31,37 @@ const legacyLimiter = rateLimit({
 });
 
 function initializeLegacyApi(sessions, sessionTokens) {
+    // Token validation middleware
+    const validateToken = (req, res, next) => {
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.split(' ')[1];
+
+        if (token == null) {
+            return res.status(401).json({ status: 'error', message: 'No token provided' });
+        }
+
+        const sessionId = req.query.sessionId || req.body.sessionId || req.params.sessionId;
+        if (sessionId) {
+            const expectedToken = sessionTokens.get(sessionId);
+            if (expectedToken && token === expectedToken) {
+                return next();
+            }
+        }
+
+        const isAnyTokenValid = Array.from(sessionTokens.values()).includes(token);
+        if (isAnyTokenValid) {
+            if (sessionId) {
+                 return res.status(403).json({ status: 'error', message: `Invalid token for session ${sessionId}` });
+            }
+            return next();
+        }
+
+        return res.status(403).json({ status: 'error', message: 'Invalid token' });
+    };
+
     // Apply rate limiting and authentication to all legacy endpoints
     router.use(legacyLimiter);
-    router.use((req, res, next) => validateToken(req, res, next, sessionTokens));
+    router.use(validateToken);
 
     // Legacy JSON endpoint
     router.post('/send-message', express.json(), async (req, res) => {
