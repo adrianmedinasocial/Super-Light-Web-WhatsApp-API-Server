@@ -709,7 +709,8 @@ function updateSessionState(sessionId, status, detail, qr, reason) {
         status,
         detail,
         qr,
-        reason
+        reason,
+        retryCount: status === 'DISCONNECTED' ? (oldSession.retryCount || 0) + 1 : 0 // Track retry attempts
     };
     sessions.set(sessionId, newSession);
 
@@ -799,12 +800,28 @@ async function connectToWhatsApp(sessionId) {
             // Get current session state to check if we're in initial auth
             const currentSession = sessions.get(sessionId);
             const isInitialAuth = currentSession && currentSession.status === 'GENERATING_QR';
+            const retryCount = currentSession?.retryCount || 0;
+
+            // 🔧 FIX: Limit retries to prevent infinite loops (especially on Android)
+            const MAX_RETRIES = 5;
+            if (retryCount >= MAX_RETRIES) {
+                log(`⛔ Max retry limit reached (${MAX_RETRIES} attempts). Stopping reconnection.`, sessionId);
+                updateSessionState(sessionId, 'DISCONNECTED', `Connection failed after ${MAX_RETRIES} attempts. Please delete and recreate the session.`, '', reason);
+
+                // Clean up session data
+                const sessionDir = path.join(__dirname, 'auth_info_baileys', sessionId);
+                if (fs.existsSync(sessionDir)) {
+                    fs.rmSync(sessionDir, { recursive: true, force: true });
+                    log(`Cleared session data for ${sessionId}`, sessionId);
+                }
+                return;
+            }
 
             // During initial authentication (QR scan), allow retry even on 401
             // 401 during QR scan is often temporary as WhatsApp validates the link
             let shouldReconnect;
             if (isInitialAuth && statusCode === 401) {
-                log(`401 during initial auth - will retry (temporary auth validation)`, sessionId);
+                log(`401 during initial auth - will retry (attempt ${retryCount + 1}/${MAX_RETRIES})`, sessionId);
                 shouldReconnect = true;
             } else {
                 // Only treat 403 as fatal (banned/blocked)
@@ -818,7 +835,7 @@ async function connectToWhatsApp(sessionId) {
             if (shouldReconnect) {
                 // Use exponential backoff for retries
                 const retryDelay = statusCode === 401 ? 3000 : 5000;
-                log(`Retrying connection in ${retryDelay}ms...`, sessionId);
+                log(`Retrying connection in ${retryDelay}ms... (attempt ${retryCount + 1}/${MAX_RETRIES})`, sessionId);
                 setTimeout(() => connectToWhatsApp(sessionId), retryDelay);
             } else {
                  log(`Not reconnecting for session ${sessionId} due to fatal error (403 - Forbidden). Please delete and recreate the session.`, sessionId);
@@ -829,8 +846,21 @@ async function connectToWhatsApp(sessionId) {
                  }
             }
         } else if (connection === 'open') {
-            log('Connection opened.', sessionId);
-            updateSessionState(sessionId, 'CONNECTED', `Connected as ${sock.user?.name || 'Unknown'}`, '', '');
+            // 🔧 FIX: Get user info properly and send webhook notification
+            const userName = sock.user?.name || sock.user?.verifiedName || sock.user?.notify || 'Unknown';
+            const userPhone = sock.user?.id?.split(':')[0] || 'Unknown';
+
+            log(`Connection opened. User: ${userName}, Phone: ${userPhone}`, sessionId);
+            updateSessionState(sessionId, 'CONNECTED', `Connected as ${userName}`, '', '');
+
+            // 🔧 FIX: Notify booking-backend that session is connected
+            postToWebhook({
+                event: 'connection-success',
+                sessionId,
+                userName,
+                userPhone,
+                status: 'CONNECTED'
+            });
         }
     });
 
