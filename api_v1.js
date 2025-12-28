@@ -29,7 +29,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-function initializeApi(sessions, sessionTokens, createSession, getSessionsDetails, deleteSession, log, userManager, activityLogger) {
+function initializeApi(sessions, sessionTokens, createSession, getSessionsDetails, deleteSession, deleteAllSessions, log, userManager, activityLogger) {
     // Security middlewares
     router.use(helmet());
     
@@ -754,6 +754,51 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         } catch (error) {
             log('API error', 'SYSTEM', { event: 'api-error', error: error.message, endpoint: req.originalUrl });
             res.status(500).json({ status: 'error', message: `Failed to delete session: ${error.message}` });
+        }
+    });
+
+    // 🚨 EMERGENCY: Delete ALL sessions (requires master key)
+    router.post('/sessions/cleanup', async (req, res) => {
+        log('API request', 'SYSTEM', { event: 'api-request', method: req.method, endpoint: req.originalUrl });
+
+        // Require master key for this dangerous operation
+        const masterKey = req.headers['x-master-key'];
+        if (masterKey !== process.env.MASTER_API_KEY) {
+            return res.status(403).json({
+                status: 'error',
+                message: 'Master API key required for cleanup operation'
+            });
+        }
+
+        try {
+            const { keep } = req.body; // Array of session IDs to keep
+            const keepSessions = Array.isArray(keep) ? keep : [];
+
+            log('🚨 EMERGENCY CLEANUP requested', 'SYSTEM', {
+                event: 'cleanup-all-sessions',
+                keepSessions
+            });
+
+            const result = await deleteAllSessions(keepSessions);
+
+            log('Cleanup completed', 'SYSTEM', {
+                event: 'cleanup-complete',
+                deleted: result.deleted,
+                remaining: result.remaining
+            });
+
+            res.status(200).json({
+                status: 'success',
+                message: 'Cleanup completed',
+                deleted: result.deleted,
+                remaining: result.remaining
+            });
+        } catch (error) {
+            log('Cleanup error', 'SYSTEM', { event: 'cleanup-error', error: error.message });
+            res.status(500).json({
+                status: 'error',
+                message: `Cleanup failed: ${error.message}`
+            });
         }
     });
 

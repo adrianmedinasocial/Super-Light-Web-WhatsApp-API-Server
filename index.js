@@ -548,7 +548,7 @@ app.post('/admin/update-logs', requireAdminAuth, express.json(), (req, res) => {
     }
 });
 
-const v1ApiRouter = initializeApi(sessions, sessionTokens, createSession, getSessionsDetails, deleteSession, log, userManager, activityLogger);
+const v1ApiRouter = initializeApi(sessions, sessionTokens, createSession, getSessionsDetails, deleteSession, deleteAllSessions, log, userManager, activityLogger);
 const legacyApiRouter = initializeLegacyApi(sessions, sessionTokens);
 app.use('/api/v1', v1ApiRouter);
 app.use('/api', legacyApiRouter); // Mount legacy routes at /api
@@ -1054,12 +1054,12 @@ async function deleteSession(sessionId) {
             log(`Error during logout for session ${sessionId}: ${err.message}`, sessionId);
         }
     }
-    
+
     // Remove session ownership
     if (session && session.owner) {
         await userManager.removeSessionFromUser(session.owner, sessionId);
     }
-    
+
     sessions.delete(sessionId);
     sessionTokens.delete(sessionId);
     saveTokens();
@@ -1069,6 +1069,66 @@ async function deleteSession(sessionId) {
     }
     log(`Session ${sessionId} deleted and data cleared.`, 'SYSTEM');
     broadcast({ type: 'session-update', data: getSessionsDetails() });
+}
+
+// 🚨 EMERGENCY: Delete ALL sessions (memory + disk)
+async function deleteAllSessions(keepSessions = []) {
+    log('🚨 EMERGENCY CLEANUP: Deleting all sessions...', 'SYSTEM');
+
+    // 1. Delete from memory
+    const allSessionIds = Array.from(sessions.keys());
+    log(`Found ${allSessionIds.length} sessions in memory`, 'SYSTEM');
+
+    for (const sessionId of allSessionIds) {
+        if (keepSessions.includes(sessionId)) {
+            log(`🔒 Keeping session: ${sessionId}`, 'SYSTEM');
+            continue;
+        }
+
+        const session = sessions.get(sessionId);
+        if (session && session.sock) {
+            try {
+                await session.sock.logout();
+            } catch (err) {
+                log(`Error during logout for ${sessionId}: ${err.message}`, sessionId);
+            }
+        }
+
+        if (session && session.owner) {
+            await userManager.removeSessionFromUser(session.owner, sessionId);
+        }
+
+        sessions.delete(sessionId);
+        sessionTokens.delete(sessionId);
+        log(`✅ Deleted from memory: ${sessionId}`, 'SYSTEM');
+    }
+
+    // 2. Delete from disk (even orphaned folders)
+    const sessionsDir = path.join(__dirname, 'auth_info_baileys');
+    if (fs.existsSync(sessionsDir)) {
+        const sessionFolders = fs.readdirSync(sessionsDir);
+        log(`Found ${sessionFolders.length} session folders on disk`, 'SYSTEM');
+
+        for (const folder of sessionFolders) {
+            if (keepSessions.includes(folder)) {
+                log(`🔒 Keeping folder: ${folder}`, 'SYSTEM');
+                continue;
+            }
+
+            const folderPath = path.join(sessionsDir, folder);
+            if (fs.statSync(folderPath).isDirectory()) {
+                fs.rmSync(folderPath, { recursive: true, force: true });
+                log(`✅ Deleted folder: ${folder}`, 'SYSTEM');
+            }
+        }
+    }
+
+    saveTokens();
+    broadcast({ type: 'session-update', data: getSessionsDetails() });
+
+    const remaining = sessions.size;
+    log(`🎉 Cleanup complete. Remaining sessions: ${remaining}`, 'SYSTEM');
+    return { deleted: allSessionIds.length - remaining, remaining };
 }
 
 const PORT = process.env.PORT || 3000;
