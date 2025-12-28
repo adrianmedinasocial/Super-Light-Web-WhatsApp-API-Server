@@ -738,6 +738,11 @@ async function connectToWhatsApp(sessionId) {
     const { version, isLatest } = await fetchLatestBaileysVersion();
     log(`Using WA version: ${version.join('.')}, isLatest: ${isLatest}`, sessionId);
 
+    // 🔧 FIX: Use appropriate browser config based on session metadata
+    // This helps with Android/iPhone compatibility
+    const browserConfig = Browsers.appropriate('Desktop');
+    log(`Using browser config: ${JSON.stringify(browserConfig)}`, sessionId);
+
     const sock = makeWASocket({
         version,
         auth: {
@@ -746,22 +751,28 @@ async function connectToWhatsApp(sessionId) {
         },
         printQRInTerminal: false,
         logger,
-        browser: Browsers.macOS('Desktop'),
+        browser: browserConfig,  // 🔧 Changed from macOS to appropriate
         generateHighQualityLinkPreview: false, // Disable to save memory
         shouldIgnoreJid: (jid) => isJidBroadcast(jid),
-        qrTimeout: 30000,
+        qrTimeout: 60000,  // 🔧 Increased from 30s to 60s for slower connections
         // Memory optimization settings
         markOnlineOnConnect: false,
         syncFullHistory: false,
         // Reduce message retry count
         retryRequestDelayMs: 2000,
-        maxMsgRetryCount: 3,
+        maxMsgRetryCount: 5,  // 🔧 Increased from 3 to 5 for better reliability
         // Connection options for stability
-        connectTimeoutMs: 30000,
-        keepAliveIntervalMs: 30000,
+        connectTimeoutMs: 60000,  // 🔧 Increased from 30s to 60s
+        keepAliveIntervalMs: 25000,  // 🔧 Decreased slightly for better connection monitoring
         // Disable unnecessary features
         fireInitQueries: false,
-        emitOwnEvents: false
+        emitOwnEvents: false,
+        // 🔧 Additional settings for better Android/iPhone compatibility
+        defaultQueryTimeoutMs: 60000,
+        getMessage: async (key) => {
+            // Return undefined to indicate message not found in cache
+            return undefined;
+        }
     });
     
     sock.ev.on('creds.update', saveCreds);
@@ -784,13 +795,26 @@ async function connectToWhatsApp(sessionId) {
     });
 
     sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      const { connection, lastDisconnect, qr, isNewLogin, isOnline, receivedPendingNotifications } = update;
         const statusCode = (lastDisconnect?.error instanceof Boom) ? lastDisconnect.error.output.statusCode : 0;
 
-        log(`Connection update: ${connection}, status code: ${statusCode}`, sessionId);
+        // 🔧 Enhanced logging for debugging Android/iPhone issues
+        log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`, sessionId);
+        log(`Connection update:`, sessionId);
+        log(`  connection: ${connection}`, sessionId);
+        log(`  statusCode: ${statusCode}`, sessionId);
+        log(`  isNewLogin: ${isNewLogin}`, sessionId);
+        log(`  isOnline: ${isOnline}`, sessionId);
+        log(`  receivedPendingNotifications: ${receivedPendingNotifications}`, sessionId);
+        log(`  hasQR: ${qr ? 'YES' : 'NO'}`, sessionId);
+        if (lastDisconnect?.error) {
+            log(`  error: ${lastDisconnect.error.message}`, sessionId);
+        }
+        log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`, sessionId);
 
       if (qr) {
-            log('QR code generated.', sessionId);
+            log('✅ QR code generated successfully', sessionId);
+            log(`   QR length: ${qr.length} characters`, sessionId);
             updateSessionState(sessionId, 'GENERATING_QR', 'QR code available.', qr, '');
         }
 
@@ -817,32 +841,59 @@ async function connectToWhatsApp(sessionId) {
                 return;
             }
 
+            // 🔧 FIX: Improved reconnection logic for Android/iPhone compatibility
             // During initial authentication (QR scan), allow retry even on 401
             // 401 during QR scan is often temporary as WhatsApp validates the link
             let shouldReconnect;
+            let retryDelay;
+
             if (isInitialAuth && statusCode === 401) {
-                log(`401 during initial auth - will retry (attempt ${retryCount + 1}/${MAX_RETRIES})`, sessionId);
+                log(`⚠️  401 during initial auth (QR scan phase) - will retry (attempt ${retryCount + 1}/${MAX_RETRIES})`, sessionId);
+                log(`   This is common during QR scan, especially on Android`, sessionId);
                 shouldReconnect = true;
+                retryDelay = 5000;  // 5s delay for initial auth retries
+            } else if (statusCode === 401) {
+                // 401 after initial auth - could be session expired
+                log(`⚠️  401 after initial auth - possible session issue (attempt ${retryCount + 1}/${MAX_RETRIES})`, sessionId);
+                shouldReconnect = retryCount < MAX_RETRIES;
+                retryDelay = 8000;  // Longer delay for post-auth 401s
+            } else if (statusCode === 403) {
+                // 403 is FATAL - banned/blocked
+                log(`🚫 403 Forbidden - account may be banned or blocked`, sessionId);
+                shouldReconnect = false;
+            } else if (statusCode === 428 || statusCode === 440) {
+                // Connection/timeout issues - retry with longer delay
+                log(`⏱️  Connection timeout (${statusCode}) - will retry with longer delay`, sessionId);
+                shouldReconnect = true;
+                retryDelay = 10000;  // 10s for timeout issues
+            } else if (statusCode === 500 || statusCode === 503) {
+                // Server errors - retry with backoff
+                log(`🔧 WhatsApp server error (${statusCode}) - will retry`, sessionId);
+                shouldReconnect = true;
+                retryDelay = 15000;  // 15s for server errors
             } else {
-                // Only treat 403 as fatal (banned/blocked)
-                // Allow retry on 401, 408 (timeout), 409, 428, 440, 500, etc.
+                // Default behavior for other error codes
                 shouldReconnect = statusCode !== 403;
+                retryDelay = 5000;
             }
 
-            log(`Connection closed. Reason: ${reason}, statusCode: ${statusCode}. Reconnecting: ${shouldReconnect}`, sessionId);
-            updateSessionState(sessionId, 'DISCONNECTED', 'Connection closed.', '', reason);
+            log(`📊 Connection closed summary:`, sessionId);
+            log(`   Reason: ${reason}`, sessionId);
+            log(`   Status Code: ${statusCode}`, sessionId);
+            log(`   Will Reconnect: ${shouldReconnect}`, sessionId);
+            log(`   Retry Count: ${retryCount + 1}/${MAX_RETRIES}`, sessionId);
+
+            updateSessionState(sessionId, 'DISCONNECTED', `Connection closed (${statusCode}): ${reason}`, '', reason);
 
             if (shouldReconnect) {
-                // Use exponential backoff for retries
-                const retryDelay = statusCode === 401 ? 3000 : 5000;
-                log(`Retrying connection in ${retryDelay}ms... (attempt ${retryCount + 1}/${MAX_RETRIES})`, sessionId);
+                log(`🔄 Retrying connection in ${retryDelay}ms... (attempt ${retryCount + 1}/${MAX_RETRIES})`, sessionId);
                 setTimeout(() => connectToWhatsApp(sessionId), retryDelay);
             } else {
-                 log(`Not reconnecting for session ${sessionId} due to fatal error (403 - Forbidden). Please delete and recreate the session.`, sessionId);
+                 log(`⛔ Not reconnecting for session ${sessionId} due to fatal error (${statusCode}). Please delete and recreate the session.`, sessionId);
                  const sessionDir = path.join(__dirname, 'auth_info_baileys', sessionId);
                  if (fs.existsSync(sessionDir)) {
                     fs.rmSync(sessionDir, { recursive: true, force: true });
-                    log(`Cleared session data for ${sessionId}`, sessionId);
+                    log(`🗑️  Cleared session data for ${sessionId}`, sessionId);
                  }
             }
         } else if (connection === 'open') {
@@ -850,17 +901,26 @@ async function connectToWhatsApp(sessionId) {
             const userName = sock.user?.name || sock.user?.verifiedName || sock.user?.notify || 'Unknown';
             const userPhone = sock.user?.id?.split(':')[0] || 'Unknown';
 
-            log(`Connection opened. User: ${userName}, Phone: ${userPhone}`, sessionId);
+            log(`🎉 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`, sessionId);
+            log(`🎉 CONNECTION SUCCESSFUL!`, sessionId);
+            log(`🎉 User: ${userName}`, sessionId);
+            log(`🎉 Phone: ${userPhone}`, sessionId);
+            log(`🎉 Session ID: ${sessionId}`, sessionId);
+            log(`🎉 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`, sessionId);
+
             updateSessionState(sessionId, 'CONNECTED', `Connected as ${userName}`, '', '');
 
             // 🔧 FIX: Notify booking-backend that session is connected
-            postToWebhook({
+            const webhookData = {
                 event: 'connection-success',
                 sessionId,
                 userName,
                 userPhone,
                 status: 'CONNECTED'
-            });
+            };
+            log(`📤 Sending webhook notification to backend:`, sessionId);
+            log(`   ${JSON.stringify(webhookData, null, 2)}`, sessionId);
+            postToWebhook(webhookData);
         }
     });
 
