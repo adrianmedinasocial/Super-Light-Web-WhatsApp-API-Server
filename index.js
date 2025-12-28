@@ -812,6 +812,34 @@ async function connectToWhatsApp(sessionId) {
         }
         log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`, sessionId);
 
+        // 🔧 FIX: Detect successful QR scan even if connection doesn't reach 'open' immediately
+        // This handles Android devices that may disconnect/reconnect during pairing
+        if (isNewLogin && sock.user) {
+            const userName = sock.user?.name || sock.user?.verifiedName || sock.user?.notify || 'Unknown';
+            const userPhone = sock.user?.id?.split(':')[0] || 'Unknown';
+
+            log(`🎉 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`, sessionId);
+            log(`🎉 QR SCAN SUCCESSFUL (isNewLogin detected)!`, sessionId);
+            log(`🎉 User: ${userName}`, sessionId);
+            log(`🎉 Phone: ${userPhone}`, sessionId);
+            log(`🎉 Session ID: ${sessionId}`, sessionId);
+            log(`🎉 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`, sessionId);
+
+            updateSessionState(sessionId, 'CONNECTED', `Connected as ${userName}`, '', '');
+
+            // 🔧 Notify booking-backend that session is connected
+            const webhookData = {
+                event: 'connection-success',
+                sessionId,
+                userName,
+                userPhone,
+                status: 'CONNECTED'
+            };
+            log(`📤 Sending webhook notification to backend (via isNewLogin):`, sessionId);
+            log(`   ${JSON.stringify(webhookData, null, 2)}`, sessionId);
+            postToWebhook(webhookData);
+        }
+
       if (qr) {
             log('✅ QR code generated successfully', sessionId);
             log(`   QR length: ${qr.length} characters`, sessionId);
