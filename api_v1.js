@@ -146,13 +146,13 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
 
     router.get('/sessions', (req, res) => {
         log('API request', 'SYSTEM', { event: 'api-request', method: req.method, endpoint: req.originalUrl });
-        
+
         // Get current user from session
         const currentUser = req.session && req.session.adminAuthed ? {
             email: req.session.userEmail,
             role: req.session.userRole
         } : null;
-        
+
         if (currentUser) {
             // If authenticated, filter sessions based on role
             res.status(200).json(getSessionsDetails(currentUser.email, currentUser.role === 'admin'));
@@ -160,6 +160,32 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
             // For API access without authentication, show all sessions (backward compatibility)
             res.status(200).json(getSessionsDetails());
         }
+    });
+
+    // Get specific session by ID
+    router.get('/sessions/:sessionId', (req, res) => {
+        log('API request', 'SYSTEM', { event: 'api-request', method: req.method, endpoint: req.originalUrl, params: req.params });
+
+        const { sessionId } = req.params;
+        const session = sessions.get(sessionId);
+
+        if (!session) {
+            return res.status(404).json({
+                status: 'error',
+                message: `Session ${sessionId} not found`
+            });
+        }
+
+        const token = sessionTokens.get(sessionId);
+
+        res.status(200).json({
+            sessionId: session.sessionId,
+            status: session.status,
+            detail: session.detail,
+            qr: session.qr || '',
+            token: token || null,
+            owner: session.owner || 'system'
+        });
     });
 
     // Campaign Management Endpoints (Session-based auth, not token-based)
