@@ -1151,14 +1151,30 @@ async function initializeExistingSessions() {
     const sessionsDir = path.join(__dirname, 'auth_info_baileys');
     if (fs.existsSync(sessionsDir)) {
         const sessionFolders = fs.readdirSync(sessionsDir);
-        log(`Found ${sessionFolders.length} existing session(s). Initializing...`);
+        log(`Found ${sessionFolders.length} folder(s) on disk. Checking for valid sessions...`);
+
+        // Only initialize sessions that have a valid token
+        let initialized = 0;
+        let cleaned = 0;
+
         for (const sessionId of sessionFolders) {
             const sessionPath = path.join(sessionsDir, sessionId);
             if (fs.statSync(sessionPath).isDirectory()) {
-                log(`Re-initializing session: ${sessionId}`);
-                await createSession(sessionId); // Await creation to prevent race conditions
+                // Check if this session has a valid token
+                if (sessionTokens.has(sessionId)) {
+                    log(`Re-initializing session: ${sessionId}`);
+                    await createSession(sessionId);
+                    initialized++;
+                } else {
+                    // Orphaned folder - clean it up
+                    log(`Cleaning up orphaned session folder: ${sessionId}`, 'SYSTEM');
+                    fs.rmSync(sessionPath, { recursive: true, force: true });
+                    cleaned++;
+                }
             }
         }
+
+        log(`Session initialization complete: ${initialized} initialized, ${cleaned} orphaned folders cleaned`);
     }
 }
 
