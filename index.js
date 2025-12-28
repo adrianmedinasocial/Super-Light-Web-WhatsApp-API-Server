@@ -1166,9 +1166,9 @@ async function initializeExistingSessions() {
                     await createSession(sessionId);
                     initialized++;
                 } else {
-                    // Orphaned folder - clean it up
-                    log(`Cleaning up orphaned session folder: ${sessionId}`, 'SYSTEM');
-                    fs.rmSync(sessionPath, { recursive: true, force: true });
+                    // Session without token - skip re-initialization but KEEP the folder
+                    // This preserves sessions if token file is lost/corrupted
+                    log(`⏭️  Skipping session ${sessionId} (no token found, keeping folder intact)`, 'SYSTEM');
                     cleaned++;
                 }
             }
