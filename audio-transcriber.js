@@ -219,7 +219,7 @@ class AudioTranscriber {
      * @param {Object} sock - Baileys socket instance
      * @param {Object} message - WhatsApp message object
      * @param {string} sessionId - Session identifier
-     * @returns {Promise<Object>} - Enhanced message data with transcription
+     * @returns {Promise<Object>} - Enhanced message data with transcription and audio base64
      */
     async processMessage(sock, message, sessionId) {
         const msgInfo = this.detectMessageType(message);
@@ -230,25 +230,35 @@ class AudioTranscriber {
             transcription: null,
             isVoiceNote: msgInfo.isVoiceNote || false,
             duration: msgInfo.duration || null,
-            mimetype: msgInfo.mimetype || null
+            mimetype: msgInfo.mimetype || null,
+            base64: null,
+            fileSizeKB: null
         };
 
-        // If message has audio and transcription is enabled
-        if (msgInfo.hasAudio && this.isEnabled()) {
+        // If message has audio
+        if (msgInfo.hasAudio) {
             try {
-                console.log(`🎵 [${sessionId}] Downloading audio for transcription...`);
+                console.log(`🎵 [${sessionId}] Downloading audio...`);
                 const audioBuffer = await this.downloadMedia(sock, message);
                 
-                console.log(`🎤 [${sessionId}] Transcribing audio (${msgInfo.duration || '?'}s)...`);
-                const transcription = await this.transcribe(audioBuffer, msgInfo.mimetype);
-                
-                if (transcription.success) {
-                    console.log(`✅ [${sessionId}] Transcription complete in ${transcription.processingTimeMs}ms`);
-                    console.log(`   Text: "${transcription.text.substring(0, 100)}${transcription.text.length > 100 ? '...' : ''}"`);
-                    result.transcription = transcription;
-                } else {
-                    console.log(`❌ [${sessionId}] Transcription failed: ${transcription.error}`);
-                    result.transcription = { success: false, error: transcription.error };
+                // Convert to Base64 for webhook
+                result.base64 = audioBuffer.toString('base64');
+                result.fileSizeKB = Math.round(audioBuffer.length / 1024);
+                console.log(`📦 [${sessionId}] Audio size: ${result.fileSizeKB}KB`);
+
+                // Transcribe if enabled
+                if (this.isEnabled()) {
+                    console.log(`🎤 [${sessionId}] Transcribing audio (${msgInfo.duration || '?'}s)...`);
+                    const transcription = await this.transcribe(audioBuffer, msgInfo.mimetype);
+                    
+                    if (transcription.success) {
+                        console.log(`✅ [${sessionId}] Transcription complete in ${transcription.processingTimeMs}ms`);
+                        console.log(`   Text: "${transcription.text.substring(0, 100)}${transcription.text.length > 100 ? '...' : ''}"`);
+                        result.transcription = transcription;
+                    } else {
+                        console.log(`❌ [${sessionId}] Transcription failed: ${transcription.error}`);
+                        result.transcription = { success: false, error: transcription.error };
+                    }
                 }
             } catch (error) {
                 console.error(`❌ [${sessionId}] Error processing audio:`, error.message);

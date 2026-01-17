@@ -162,21 +162,47 @@ When a voice message is received:
     "from": "5491123456789@s.whatsapp.net",
     "messageId": "ABC123",
     "messageType": "audio",
-    "transcribedText": "Hello, this is a voice message",
+    "transcribedText": "Hola, este es un mensaje de voz",
     "audio": {
         "isVoiceNote": true,
         "duration": 5,
         "mimetype": "audio/ogg; codecs=opus",
+        "fileSizeKB": 48,
+        "base64": "T2dnUwACAAAAAAAAAAA...(audio completo en base64)",
         "transcription": {
             "success": true,
-            "text": "Hello, this is a voice message",
-            "language": "en",
+            "text": "Hola, este es un mensaje de voz",
+            "language": "es",
             "duration": 5.2,
             "processingTimeMs": 450
         }
     },
     "data": { ... }
 }
+```
+
+### Using the Base64 Audio
+
+Your backend can decode and save the audio:
+
+**Node.js:**
+```javascript
+const audioBuffer = Buffer.from(payload.audio.base64, 'base64');
+fs.writeFileSync('audio.ogg', audioBuffer);
+```
+
+**PHP:**
+```php
+$audioData = base64_decode($payload['audio']['base64']);
+file_put_contents('audio.ogg', $audioData);
+```
+
+**Python:**
+```python
+import base64
+audio_data = base64.b64decode(payload['audio']['base64'])
+with open('audio.ogg', 'wb') as f:
+    f.write(audio_data)
 ```
 
 ### Supported Audio Formats

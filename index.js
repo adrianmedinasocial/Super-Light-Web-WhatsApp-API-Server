@@ -797,17 +797,19 @@ async function connectToWhatsApp(sessionId) {
                 data: msg
             };
 
-            // If message contains audio, attempt transcription
-            if (msgTypeInfo.hasAudio && audioTranscriber.isEnabled()) {
+            // If message contains audio, download and transcribe
+            if (msgTypeInfo.hasAudio) {
                 try {
-                    log(`🎤 Processing audio message for transcription...`, sessionId);
+                    log(`🎤 Processing audio message...`, sessionId);
                     const audioResult = await audioTranscriber.processMessage(sock, msg, sessionId);
                     
-                    // Add transcription data to webhook payload
+                    // Add audio data to webhook payload (including Base64)
                     messageData.audio = {
                         isVoiceNote: audioResult.isVoiceNote,
                         duration: audioResult.duration,
                         mimetype: audioResult.mimetype,
+                        fileSizeKB: audioResult.fileSizeKB,
+                        base64: audioResult.base64,
                         transcription: audioResult.transcription
                     };
 
@@ -815,11 +817,14 @@ async function connectToWhatsApp(sessionId) {
                         messageData.transcribedText = audioResult.transcription.text;
                         log(`✅ Transcription: "${audioResult.transcription.text.substring(0, 50)}..."`, sessionId);
                     }
+                    
+                    log(`📦 Audio included in webhook (${audioResult.fileSizeKB}KB)`, sessionId);
                 } catch (error) {
                     log(`❌ Audio processing error: ${error.message}`, sessionId);
                     messageData.audio = {
                         error: error.message,
-                        transcription: null
+                        transcription: null,
+                        base64: null
                     };
                 }
             }
