@@ -31,6 +31,9 @@ package-lock.json
 # Media Files (user uploads)
 media/
 
+# Temporary Audio Files (transcription)
+temp_audio/
+
 # IDE & Editor Files
 .idea/
 .vscode/
