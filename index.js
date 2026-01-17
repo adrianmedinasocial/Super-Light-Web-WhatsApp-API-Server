@@ -53,9 +53,17 @@ const wsClients = new Map(); // Maps WebSocket client to user info
 
 const logger = pino({ level: 'debug' });
 
-const TOKENS_FILE = path.join(__dirname, 'session_tokens.json');
-const ENCRYPTED_TOKENS_FILE = path.join(__dirname, 'session_tokens.enc');
+// Persistent data directory (use DATA_DIR env for Railway volumes, fallback to local)
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(__dirname, 'auth_info_baileys');
+
+const TOKENS_FILE = path.join(DATA_DIR, 'session_tokens.json');
+const ENCRYPTED_TOKENS_FILE = path.join(DATA_DIR, 'session_tokens.enc');
 let sessionTokens = new Map();
+
+// Log data directories on startup
+console.log(`📁 Data directory: ${DATA_DIR}`);
+console.log(`📁 Sessions directory: ${SESSIONS_DIR}`);
 
 // Encryption key - MUST be stored in .env file
 const ENCRYPTION_KEY = process.env.TOKEN_ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
@@ -731,7 +739,7 @@ async function connectToWhatsApp(sessionId) {
     updateSessionState(sessionId, 'CONNECTING', 'Initializing session...', '', '');
     log('Starting session...', sessionId);
 
-    const sessionDir = path.join(__dirname, 'auth_info_baileys', sessionId);
+    const sessionDir = path.join(SESSIONS_DIR, sessionId);
     if (!fs.existsSync(sessionDir)) {
         fs.mkdirSync(sessionDir, { recursive: true });
     }
@@ -900,7 +908,7 @@ async function connectToWhatsApp(sessionId) {
                 updateSessionState(sessionId, 'DISCONNECTED', `Connection failed after ${MAX_RETRIES} attempts. Please delete and recreate the session.`, '', reason);
 
                 // Clean up session data
-                const sessionDir = path.join(__dirname, 'auth_info_baileys', sessionId);
+                const sessionDir = path.join(SESSIONS_DIR, sessionId);
                 if (fs.existsSync(sessionDir)) {
                     fs.rmSync(sessionDir, { recursive: true, force: true });
                     log(`Cleared session data for ${sessionId}`, sessionId);
@@ -957,7 +965,7 @@ async function connectToWhatsApp(sessionId) {
                 setTimeout(() => connectToWhatsApp(sessionId), retryDelay);
             } else {
                  log(`⛔ Not reconnecting for session ${sessionId} due to fatal error (${statusCode}). Please delete and recreate the session.`, sessionId);
-                 const sessionDir = path.join(__dirname, 'auth_info_baileys', sessionId);
+                 const sessionDir = path.join(SESSIONS_DIR, sessionId);
                  if (fs.existsSync(sessionDir)) {
                     fs.rmSync(sessionDir, { recursive: true, force: true });
                     log(`🗑️  Cleared session data for ${sessionId}`, sessionId);
@@ -1102,7 +1110,7 @@ async function deleteSession(sessionId) {
     sessions.delete(sessionId);
     sessionTokens.delete(sessionId);
     saveTokens();
-    const sessionDir = path.join(__dirname, 'auth_info_baileys', sessionId);
+    const sessionDir = path.join(SESSIONS_DIR, sessionId);
     if (fs.existsSync(sessionDir)) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
     }
@@ -1143,7 +1151,7 @@ async function deleteAllSessions(keepSessions = []) {
     }
 
     // 2. Delete from disk (even orphaned folders)
-    const sessionsDir = path.join(__dirname, 'auth_info_baileys');
+    const sessionsDir = SESSIONS_DIR;
     if (fs.existsSync(sessionsDir)) {
         const sessionFolders = fs.readdirSync(sessionsDir);
         log(`Found ${sessionFolders.length} session folders on disk`, 'SYSTEM');
@@ -1187,7 +1195,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 async function initializeExistingSessions() {
-    const sessionsDir = path.join(__dirname, 'auth_info_baileys');
+    const sessionsDir = SESSIONS_DIR;
     if (fs.existsSync(sessionsDir)) {
         const sessionFolders = fs.readdirSync(sessionsDir);
         log(`Found ${sessionFolders.length} folder(s) on disk. Checking for valid sessions...`);
