@@ -50,6 +50,12 @@ A powerful, lightweight, and multi-session WhatsApp API server using the `@whisk
     -   Endpoints for sending messages (text, image, document), uploading media, and deleting messages.
     -   Send media by uploading a file or providing a direct URL.
     -   Support for large files up to 25MB (images, documents, PDFs, Word, Excel)
+-   **🎤 Audio Transcription (NEW):**
+    -   Automatic transcription of voice messages using Groq Whisper API
+    -   Ultra-fast processing (~400-500ms) with high accuracy
+    -   Supports 50+ languages with automatic detection
+    -   Transcribed text included in webhook payload
+    -   Free tier available (~8 hours/day of transcription)
 -   **Webhook Support:**
     -   Configure a webhook URL to receive events for new messages and session status changes.
 -   **Legacy API Support:** Includes backward-compatible endpoints for easier migration from older systems.
@@ -125,6 +131,73 @@ All user actions are logged and encrypted:
 - User management actions
 
 Admins can view all activities at `/admin/activities.html`
+
+## 🎤 Audio Transcription
+
+The server now supports automatic transcription of voice messages using Groq's Whisper API.
+
+### Setup
+
+1. Get a free API key at [https://console.groq.com/keys](https://console.groq.com/keys)
+2. Add to your `.env` file:
+   ```env
+   GROQ_API_KEY=gsk_your_api_key_here
+   ENABLE_AUDIO_TRANSCRIPTION=true
+   ```
+
+### How It Works
+
+When a voice message is received:
+1. The server detects the audio message type (voice note, audio file, or video)
+2. Downloads the media from WhatsApp
+3. Sends it to Groq Whisper API for transcription (~400-500ms)
+4. Includes the transcribed text in the webhook payload
+
+### Webhook Payload Example
+
+```json
+{
+    "event": "new-message",
+    "sessionId": "mySession",
+    "from": "5491123456789@s.whatsapp.net",
+    "messageId": "ABC123",
+    "messageType": "audio",
+    "transcribedText": "Hello, this is a voice message",
+    "audio": {
+        "isVoiceNote": true,
+        "duration": 5,
+        "mimetype": "audio/ogg; codecs=opus",
+        "transcription": {
+            "success": true,
+            "text": "Hello, this is a voice message",
+            "language": "en",
+            "duration": 5.2,
+            "processingTimeMs": 450
+        }
+    },
+    "data": { ... }
+}
+```
+
+### Supported Audio Formats
+
+- Voice notes (PTT)
+- Audio files: `mp3`, `ogg`, `wav`, `m4a`, `webm`, `flac`
+- Video audio tracks: `mp4`, `mpeg`
+
+### Pricing
+
+Groq offers a generous free tier:
+- **Free**: ~8 hours of transcription per day
+- **Paid**: $0.04/hour (`whisper-large-v3-turbo`) or $0.111/hour (`whisper-large-v3`)
+
+### Configuration Options
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GROQ_API_KEY` | - | Your Groq API key (required for transcription) |
+| `ENABLE_AUDIO_TRANSCRIPTION` | `true` | Enable/disable transcription |
+| `GROQ_WHISPER_MODEL` | `whisper-large-v3-turbo` | Whisper model to use |
 
 ## Prerequisites
 

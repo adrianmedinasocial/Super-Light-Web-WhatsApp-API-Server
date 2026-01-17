@@ -40,6 +40,7 @@ const session = require('express-session');
 const FileStore = require('session-file-store')(session);
 const UserManager = require('./users');
 const ActivityLogger = require('./activity-logger');
+const AudioTranscriber = require('./audio-transcriber');
 
 const sessions = new Map();
 const retries = new Map();
@@ -66,6 +67,7 @@ if (!process.env.TOKEN_ENCRYPTION_KEY) {
 // Initialize user management and activity logging
 const userManager = new UserManager(ENCRYPTION_KEY);
 const activityLogger = new ActivityLogger(ENCRYPTION_KEY);
+const audioTranscriber = new AudioTranscriber();
 
 // Encryption functions
 function encrypt(text) {
@@ -780,16 +782,48 @@ async function connectToWhatsApp(sessionId) {
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
         if (!msg.key.fromMe) {
-            log(`Received new message from ${msg.key.remoteJid}`, sessionId);
+            // Detect message type and check for audio
+            const msgTypeInfo = audioTranscriber.detectMessageType(msg);
+            log(`Received ${msgTypeInfo.type} message from ${msg.key.remoteJid}`, sessionId);
             
+            // Base message data
             const messageData = {
                 event: 'new-message',
                 sessionId,
                 from: msg.key.remoteJid,
                 messageId: msg.key.id,
                 timestamp: msg.messageTimestamp,
+                messageType: msgTypeInfo.type,
                 data: msg
             };
+
+            // If message contains audio, attempt transcription
+            if (msgTypeInfo.hasAudio && audioTranscriber.isEnabled()) {
+                try {
+                    log(`🎤 Processing audio message for transcription...`, sessionId);
+                    const audioResult = await audioTranscriber.processMessage(sock, msg, sessionId);
+                    
+                    // Add transcription data to webhook payload
+                    messageData.audio = {
+                        isVoiceNote: audioResult.isVoiceNote,
+                        duration: audioResult.duration,
+                        mimetype: audioResult.mimetype,
+                        transcription: audioResult.transcription
+                    };
+
+                    if (audioResult.transcription && audioResult.transcription.success) {
+                        messageData.transcribedText = audioResult.transcription.text;
+                        log(`✅ Transcription: "${audioResult.transcription.text.substring(0, 50)}..."`, sessionId);
+                    }
+                } catch (error) {
+                    log(`❌ Audio processing error: ${error.message}`, sessionId);
+                    messageData.audio = {
+                        error: error.message,
+                        transcription: null
+                    };
+                }
+            }
+
             await postToWebhook(messageData);
         }
     });
