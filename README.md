@@ -205,11 +205,59 @@ with open('audio.ogg', 'wb') as f:
     f.write(audio_data)
 ```
 
-### Supported Audio Formats
+### Supported Media Formats
 
+**Audio (with transcription):**
 - Voice notes (PTT)
 - Audio files: `mp3`, `ogg`, `wav`, `m4a`, `webm`, `flac`
 - Video audio tracks: `mp4`, `mpeg`
+
+**Images:**
+- `image/jpeg`, `image/png`, `image/gif`, `image/webp`
+
+**Documents:**
+- PDF, Word, Excel, and other document types
+
+**Stickers:**
+- Static and animated stickers
+
+### Image Webhook Payload Example
+
+```json
+{
+    "event": "new-message",
+    "sessionId": "mySession",
+    "from": "5491123456789@s.whatsapp.net",
+    "messageId": "ABC123",
+    "messageType": "image",
+    "media": {
+        "type": "image",
+        "mimetype": "image/jpeg",
+        "caption": "Mira esta foto!",
+        "width": 1200,
+        "height": 800,
+        "fileSizeKB": 245,
+        "base64": "/9j/4AAQSkZJRgABAQEASABIAAD..."
+    },
+    "data": { ... }
+}
+```
+
+### Document Webhook Payload Example
+
+```json
+{
+    "event": "new-message",
+    "messageType": "document",
+    "media": {
+        "type": "document",
+        "mimetype": "application/pdf",
+        "filename": "contrato.pdf",
+        "fileSizeKB": 1024,
+        "base64": "JVBERi0xLjQKJ..."
+    }
+}
+```
 
 ### Pricing
 

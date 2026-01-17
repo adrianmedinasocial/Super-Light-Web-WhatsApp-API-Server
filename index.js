@@ -836,6 +836,41 @@ async function connectToWhatsApp(sessionId) {
                     };
                 }
             }
+            // If message contains image, sticker, or document (non-audio media)
+            else if (msgTypeInfo.hasMedia && !msgTypeInfo.hasAudio) {
+                try {
+                    log(`📷 Processing ${msgTypeInfo.type} message...`, sessionId);
+                    const mediaResult = await audioTranscriber.processImage(sock, msg, sessionId);
+                    
+                    // Add media data to webhook payload based on type
+                    messageData.media = {
+                        type: mediaResult.type,
+                        mimetype: mediaResult.mimetype,
+                        caption: mediaResult.caption,
+                        fileSizeKB: mediaResult.fileSizeKB,
+                        base64: mediaResult.base64
+                    };
+
+                    // Add type-specific fields
+                    if (mediaResult.type === 'image') {
+                        messageData.media.width = mediaResult.width;
+                        messageData.media.height = mediaResult.height;
+                    } else if (mediaResult.type === 'sticker') {
+                        messageData.media.isAnimated = mediaResult.isAnimated;
+                    } else if (mediaResult.type === 'document') {
+                        messageData.media.filename = mediaResult.filename;
+                    }
+                    
+                    log(`📦 ${mediaResult.type} included in webhook (${mediaResult.fileSizeKB}KB)`, sessionId);
+                } catch (error) {
+                    log(`❌ Media processing error: ${error.message}`, sessionId);
+                    messageData.media = {
+                        type: msgTypeInfo.type,
+                        error: error.message,
+                        base64: null
+                    };
+                }
+            }
 
             await postToWebhook(messageData);
         }

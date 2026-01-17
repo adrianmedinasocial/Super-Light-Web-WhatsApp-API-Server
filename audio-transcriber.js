@@ -65,11 +65,11 @@ class AudioTranscriber {
     /**
      * Detect message type from WhatsApp message object
      * @param {Object} message - WhatsApp message object from Baileys
-     * @returns {Object} - { type: string, hasAudio: boolean, messageContent: Object }
+     * @returns {Object} - { type: string, hasAudio: boolean, hasMedia: boolean, messageContent: Object }
      */
     detectMessageType(message) {
         if (!message || !message.message) {
-            return { type: 'unknown', hasAudio: false, messageContent: null };
+            return { type: 'unknown', hasAudio: false, hasMedia: false, messageContent: null };
         }
 
         const msg = message.message;
@@ -79,6 +79,7 @@ class AudioTranscriber {
             return {
                 type: 'audio',
                 hasAudio: true,
+                hasMedia: true,
                 isVoiceNote: msg.audioMessage.ptt === true,
                 messageContent: msg.audioMessage,
                 mimetype: msg.audioMessage.mimetype,
@@ -91,37 +92,63 @@ class AudioTranscriber {
             return {
                 type: 'video',
                 hasAudio: true,
+                hasMedia: true,
                 messageContent: msg.videoMessage,
                 mimetype: msg.videoMessage.mimetype,
-                duration: msg.videoMessage.seconds
+                duration: msg.videoMessage.seconds,
+                caption: msg.videoMessage.caption || null
+            };
+        }
+
+        // Check for image
+        if (msg.imageMessage) {
+            return { 
+                type: 'image', 
+                hasAudio: false, 
+                hasMedia: true,
+                messageContent: msg.imageMessage,
+                mimetype: msg.imageMessage.mimetype,
+                caption: msg.imageMessage.caption || null,
+                width: msg.imageMessage.width,
+                height: msg.imageMessage.height
+            };
+        }
+
+        // Check for sticker
+        if (msg.stickerMessage) {
+            return { 
+                type: 'sticker', 
+                hasAudio: false, 
+                hasMedia: true,
+                messageContent: msg.stickerMessage,
+                mimetype: msg.stickerMessage.mimetype,
+                isAnimated: msg.stickerMessage.isAnimated || false
+            };
+        }
+
+        // Check for document
+        if (msg.documentMessage) {
+            return { 
+                type: 'document', 
+                hasAudio: false, 
+                hasMedia: true,
+                messageContent: msg.documentMessage,
+                mimetype: msg.documentMessage.mimetype,
+                filename: msg.documentMessage.fileName,
+                fileSize: msg.documentMessage.fileLength
             };
         }
 
         // Check for text message
         if (msg.conversation) {
-            return { type: 'text', hasAudio: false, messageContent: msg.conversation };
+            return { type: 'text', hasAudio: false, hasMedia: false, messageContent: msg.conversation };
         }
 
         if (msg.extendedTextMessage) {
-            return { type: 'text', hasAudio: false, messageContent: msg.extendedTextMessage.text };
+            return { type: 'text', hasAudio: false, hasMedia: false, messageContent: msg.extendedTextMessage.text };
         }
 
-        // Check for image
-        if (msg.imageMessage) {
-            return { type: 'image', hasAudio: false, messageContent: msg.imageMessage };
-        }
-
-        // Check for document
-        if (msg.documentMessage) {
-            return { type: 'document', hasAudio: false, messageContent: msg.documentMessage };
-        }
-
-        // Check for sticker
-        if (msg.stickerMessage) {
-            return { type: 'sticker', hasAudio: false, messageContent: msg.stickerMessage };
-        }
-
-        return { type: 'unknown', hasAudio: false, messageContent: null };
+        return { type: 'unknown', hasAudio: false, hasMedia: false, messageContent: null };
     }
 
     /**
@@ -264,6 +291,44 @@ class AudioTranscriber {
                 console.error(`❌ [${sessionId}] Error processing audio:`, error.message);
                 result.transcription = { success: false, error: error.message };
             }
+        }
+
+        return result;
+    }
+
+    /**
+     * Process image/sticker/document message and return base64
+     * @param {Object} sock - Baileys socket instance
+     * @param {Object} message - WhatsApp message object
+     * @param {string} sessionId - Session identifier
+     * @returns {Promise<Object>} - Media data with base64
+     */
+    async processImage(sock, message, sessionId) {
+        const msgInfo = this.detectMessageType(message);
+        
+        const result = {
+            type: msgInfo.type,
+            mimetype: msgInfo.mimetype || null,
+            caption: msgInfo.caption || null,
+            width: msgInfo.width || null,
+            height: msgInfo.height || null,
+            filename: msgInfo.filename || null,
+            isAnimated: msgInfo.isAnimated || false,
+            base64: null,
+            fileSizeKB: null
+        };
+
+        try {
+            console.log(`📷 [${sessionId}] Downloading ${msgInfo.type}...`);
+            const mediaBuffer = await this.downloadMedia(sock, message);
+            
+            result.base64 = mediaBuffer.toString('base64');
+            result.fileSizeKB = Math.round(mediaBuffer.length / 1024);
+            console.log(`📦 [${sessionId}] ${msgInfo.type} size: ${result.fileSizeKB}KB`);
+            
+        } catch (error) {
+            console.error(`❌ [${sessionId}] Error downloading ${msgInfo.type}:`, error.message);
+            result.error = error.message;
         }
 
         return result;
