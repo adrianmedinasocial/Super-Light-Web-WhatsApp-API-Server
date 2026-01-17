@@ -18,6 +18,7 @@ class AudioTranscriber {
         this.groq = null;
         this.enabled = false;
         this.model = process.env.GROQ_WHISPER_MODEL || 'whisper-large-v3-turbo';
+        this.defaultLanguage = process.env.GROQ_WHISPER_LANGUAGE || null; // ISO 639-1: 'es', 'en', 'pt', etc.
         this.tempDir = path.join(__dirname, 'temp_audio');
         
         this.initialize();
@@ -34,6 +35,7 @@ class AudioTranscriber {
                 this.ensureTempDir();
                 console.log('🎤 Audio transcription enabled (Groq Whisper API)');
                 console.log(`   Model: ${this.model}`);
+                console.log(`   Language: ${this.defaultLanguage || 'auto-detect'}`);
             } catch (error) {
                 console.error('❌ Failed to initialize Groq client:', error.message);
                 this.enabled = false;
@@ -177,9 +179,10 @@ class AudioTranscriber {
                 temperature: 0
             };
 
-            // Add language hint if provided (improves accuracy)
-            if (language) {
-                transcriptionOptions.language = language;
+            // Add language hint if provided, otherwise use default (improves accuracy)
+            const langToUse = language || this.defaultLanguage;
+            if (langToUse) {
+                transcriptionOptions.language = langToUse;
             }
 
             const startTime = Date.now();
