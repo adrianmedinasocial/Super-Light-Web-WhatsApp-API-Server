@@ -130,10 +130,11 @@ async function withCredsMutex(sessionId, fn) {
 }
 
 // Debounced saveCreds wrapper to batch rapid credential updates
-function createDebouncedSaveCreds(sessionId, originalSaveCreds, delay = 500) {
+// 🔧 FIX: Reduced delay to 100ms for faster credential persistence
+function createDebouncedSaveCreds(sessionId, originalSaveCreds, delay = 100) {
     let timeout = null;
-    let pendingPromise = null;
     let pendingResolvers = [];
+    let saveCount = 0;
 
     return async () => {
         return new Promise((resolve, reject) => {
@@ -147,14 +148,16 @@ function createDebouncedSaveCreds(sessionId, originalSaveCreds, delay = 500) {
                 const resolvers = [...pendingResolvers];
                 pendingResolvers = [];
                 timeout = null;
+                saveCount++;
 
                 try {
                     await withCredsMutex(sessionId, async () => {
                         await originalSaveCreds();
+                        console.log(`[${sessionId}] 🔐 Credentials saved (batch #${saveCount}, ${resolvers.length} updates)`);
                     });
                     resolvers.forEach(r => r.resolve());
                 } catch (err) {
-                    console.error(`[${sessionId}] Error saving credentials:`, err.message);
+                    console.error(`[${sessionId}] ❌ Error saving credentials:`, err.message);
                     resolvers.forEach(r => r.reject(err));
                 }
             }, delay);
@@ -913,7 +916,8 @@ async function connectToWhatsApp(sessionId) {
 
     // 🔧 FIX: Wrap saveCreds with debounce + mutex to prevent concurrent writes
     // This fixes intermittent "Bad MAC" errors caused by Signal key corruption
-    const saveCreds = createDebouncedSaveCreds(sessionId, originalSaveCreds, 300);
+    // 🔧 FIX: Reduced debounce to 50ms for faster Signal key persistence
+    const saveCreds = createDebouncedSaveCreds(sessionId, originalSaveCreds, 50);
     log(`🔐 Initialized debounced credential saver for session`, sessionId);
 
     const { version, isLatest } = await fetchLatestBaileysVersion();
