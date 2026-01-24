@@ -1431,9 +1431,17 @@ async function createSession(sessionId, createdBy = null) {
         throw new Error(`Maximum session limit (${MAX_SESSIONS}) reached. Please delete unused sessions.`);
     }
 
-    const token = randomUUID();
-    sessionTokens.set(sessionId, token);
-    saveTokens();
+    // 🔧 FIX: Reuse existing token if available (for session restoration after restart)
+    // Only generate new token if one doesn't exist
+    let token = sessionTokens.get(sessionId);
+    if (!token) {
+        token = randomUUID();
+        sessionTokens.set(sessionId, token);
+        saveTokens();
+        log(`🔑 Generated new token for session ${sessionId}`, 'SYSTEM');
+    } else {
+        log(`🔑 Reusing existing token for session ${sessionId}`, 'SYSTEM');
+    }
 
     // Set a placeholder before async connection with owner info
     sessions.set(sessionId, {
