@@ -916,8 +916,13 @@ async function connectToWhatsApp(sessionId) {
 
     // 🔧 FIX: Wrap saveCreds with debounce + mutex to prevent concurrent writes
     // This fixes intermittent "Bad MAC" errors caused by Signal key corruption
-    // 🔧 FIX: Reduced debounce to 50ms for faster Signal key persistence
-    const saveCreds = createDebouncedSaveCreds(sessionId, originalSaveCreds, 50);
+    // 🔧 FIX: Wrap saveCreds with mutex only (no debounce) for immediate persistence
+    // This ensures Signal keys are saved immediately to prevent Bad MAC errors
+    const saveCreds = async () => {
+        await withCredsMutex(sessionId, async () => {
+            await originalSaveCreds();
+        });
+    };
     log(`🔐 Initialized debounced credential saver for session`, sessionId);
 
     const { version, isLatest } = await fetchLatestBaileysVersion();
