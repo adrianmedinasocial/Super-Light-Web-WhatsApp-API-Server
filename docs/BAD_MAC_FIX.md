@@ -448,16 +448,184 @@ El webhook ahora incluye `originalLID` para que el backend pueda mantener su pro
 }
 ```
 
-### Limitación Conocida
+### Limitación del Cache Local (Servidor)
 
-El cache solo funciona **después** de que un mensaje con número real resuelto haya llegado. Si el primer mensaje de un usuario tiene Bad MAC y no se puede resolver, el backend recibirá el LID.
+El cache del servidor solo funciona **después** de que un mensaje con número real resuelto haya llegado. Si el primer mensaje de un usuario tiene Bad MAC y no se puede resolver, el backend recibirá el LID.
 
-**Recomendación:** El backend debería mantener su propio mapeo LID → número usando el campo `originalLID` del webhook para unificar conversaciones.
+Para resolver esta limitación, se implementó un **mapeo persistente en el backend**.
+
+---
+
+## Fix v4 Backend: Mapeo LID Persistente en Base de Datos
+
+### Problema
+El cache local del servidor WhatsApp se pierde cuando:
+1. El servidor se reinicia
+2. El cache TTL de 24 horas expira
+3. El primer mensaje de un usuario tiene Bad MAC
+
+### Solución: Mapeo Persistente en SQLite
+
+#### 1. Nueva Tabla `lid_phone_mapping`
+**Archivo:** `src/db/auto-migrate.js` (Migración 033)
+
+```sql
+CREATE TABLE lid_phone_mapping (
+    id TEXT PRIMARY KEY,
+    lid TEXT NOT NULL UNIQUE,
+    phone_number TEXT NOT NULL,
+    session_id TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_lid_mapping_lid ON lid_phone_mapping(lid);
+CREATE INDEX idx_lid_mapping_phone ON lid_phone_mapping(phone_number);
+```
+
+#### 2. Guardar Mapeo cuando llega `originalLID`
+**Archivo:** `src/routes/webhook.js`
+
+```javascript
+function saveLidMapping(lid, phoneNumber, sessionId = null) {
+    const db = getDatabase();
+    const now = new Date().toISOString();
+
+    // UPSERT: actualiza si ya existe
+    db.prepare(`
+        INSERT INTO lid_phone_mapping (id, lid, phone_number, session_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(lid) DO UPDATE SET
+            phone_number = excluded.phone_number,
+            session_id = excluded.session_id,
+            updated_at = excluded.updated_at
+    `).run(generateId(), lid, phoneNumber, sessionId, now, now);
+
+    console.log(`💾 LID mapping guardado: ${lid} → ${phoneNumber}`);
+}
+
+// En el webhook handler:
+const originalLID = event?.originalLID;
+if (originalLID && !from.includes('@lid')) {
+    saveLidMapping(originalLID, from, sessionId);
+}
+```
+
+#### 3. Resolver LID desde BD en `extractFrom()`
+**Archivo:** `src/routes/webhook.js`
+
+```javascript
+function getPhoneFromLid(lid) {
+    const db = getDatabase();
+    const mapping = db.prepare(`
+        SELECT phone_number FROM lid_phone_mapping WHERE lid = ?
+    `).get(lid);
+
+    if (mapping) {
+        console.log(`🎯 LID resuelto via DB: ${lid} → ${mapping.phone_number}`);
+        return mapping.phone_number;
+    }
+    return null;
+}
+
+// En extractFrom():
+// INTENTO 5 - Buscar en mapeo LID → número de la BD
+if (remoteJid && remoteJid.includes("@lid")) {
+    const mappedPhone = getPhoneFromLid(remoteJid);
+    if (mappedPhone) {
+        console.log(`🎯 LID resuelto via mapeo DB: ${remoteJid} → ${mappedPhone}`);
+        return mappedPhone;
+    }
+}
+```
+
+#### 4. Unificar Conversaciones en `getOrCreateConversation()`
+**Archivo:** `src/services/conversationMemory.js`
+
+```javascript
+function getPhoneFromLidMapping(lid) {
+    const db = getDatabase();
+    const mapping = db.prepare(`
+        SELECT phone_number FROM lid_phone_mapping WHERE lid = ?
+    `).get(lid);
+    return mapping?.phone_number || null;
+}
+
+export function getOrCreateConversation(userPhone, businessId, userName = null) {
+    const db = getDatabase();
+
+    // �� FIX v4: Si es LID, buscar si ya tenemos el número real mapeado
+    if (userPhone.includes("@lid")) {
+        const mappedPhone = getPhoneFromLidMapping(userPhone);
+        if (mappedPhone) {
+            console.log(`🔗 LID ${userPhone} tiene mapeo a ${mappedPhone}`);
+
+            // Verificar si existe conversación con el número real
+            const realConvId = `${mappedPhone}_${businessId}`;
+            const realConv = db.prepare(`
+                SELECT id FROM conversations WHERE id = ?
+            `).get(realConvId);
+
+            if (realConv) {
+                console.log(`🎯 Usando conversación existente con número real: ${realConvId}`);
+                userPhone = mappedPhone; // Usar el número real
+            }
+        }
+    }
+
+    // ... resto de la función
+}
+```
+
+### Logs de Diagnóstico Backend
+
+```
+💾 LID mapping guardado: 227599578050572@lid → 5215547606478
+🎯 LID resuelto via DB: 227599578050572@lid → 5215547606478
+🎯 LID resuelto via mapeo DB: 227599578050572@lid → 5215547606478
+🔗 LID 227599578050572@lid tiene mapeo a 5215547606478
+🎯 Usando conversación existente con número real: 5215547606478_businessId
+```
+
+### Flujo Completo v4
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     SERVIDOR WHATSAPP (serverbayles)                │
+├─────────────────────────────────────────────────────────────────────┤
+│  1. Mensaje llega con LID                                           │
+│  2. Busca en cache local (lidToPhoneMap)                           │
+│  3. Si encuentra → usa número real                                  │
+│  4. Si resuelve por contextInfo → guarda en cache                  │
+│  5. Envía webhook con { from: número, originalLID: lid }           │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     BACKEND (booking-backend)                        │
+├─────────────────────────────────────────────────────────────────────┤
+│  1. Recibe webhook                                                  │
+│  2. Si tiene originalLID + número real → guarda en BD              │
+│  3. extractFrom() busca en BD si llega solo LID                    │
+│  4. getOrCreateConversation() unifica usando mapeo BD              │
+│  5. Conversación única por usuario (número real)                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Ventajas del Mapeo Persistente
+
+| Aspecto | Cache Servidor | BD Backend |
+|---------|---------------|------------|
+| Persistencia | ❌ Se pierde en restart | ✅ Permanente |
+| TTL | 24 horas | ♾️ Sin expiración |
+| Primer mensaje | ❌ No funciona | ✅ Funciona si ya existe mapeo |
+| Escalabilidad | Un servidor | Cualquier instancia |
 
 ---
 
 ## Commits Relacionados
 
+### Servidor WhatsApp (serverbayles)
 1. `d5fb4d7` - Add mutex and debounce to saveCreds
 2. `ecd5ba7` - Create Express sessions directory if not exists
 3. `156cdfc` - Add ev.process() for synchronous event handling
@@ -465,7 +633,10 @@ El cache solo funciona **después** de que un mensaje con número real resuelto 
 5. `14888f1` - Remove key caching and add mutex for Signal key operations
 6. `1456d7e` - Unify all Signal operation mutexes (v2 fix)
 7. `e33843d` - Don't mark failed decryption messages as processed (v3 fix)
-8. `TBD` - Remove duplicate creds.update listener + LID cache (v4 fix)
+8. `cd633e7` - Remove duplicate creds.update listener + LID cache (v4 fix)
+
+### Backend (booking-backend)
+9. `e983297` - Fix v4 Backend: LID to phone mapping for unified conversations
 
 ## Referencias
 
