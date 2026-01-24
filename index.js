@@ -933,29 +933,65 @@ async function connectToWhatsApp(sessionId) {
     const browserConfig = Browsers.appropriate('Desktop');
     log(`Using browser config: ${JSON.stringify(browserConfig)}`, sessionId);
 
-    // 🔧 DEBUG: Wrap key store with logging to track Signal key operations
+    // 🔧 FIX: Use keys directly WITHOUT caching to prevent stale key issues
+    // The makeCacheableSignalKeyStore cache can serve outdated keys causing Bad MAC errors
     const originalKeys = state.keys;
-    const wrappedKeys = {
-        get: async (type, ids) => {
-            const result = await originalKeys.get(type, ids);
-            const foundCount = Object.keys(result).length;
-            if (type === 'session' || type === 'pre-key' || type === 'sender-key') {
-                log(`🔑 KEY GET [${type}]: requested ${ids.length} keys, found ${foundCount}`, sessionId);
+
+    // Mutex for key operations to prevent concurrent read/write issues
+    let keyOperationInProgress = false;
+    const keyOperationQueue = [];
+
+    const executeKeyOperation = async (operation) => {
+        return new Promise((resolve, reject) => {
+            const run = async () => {
+                keyOperationInProgress = true;
+                try {
+                    const result = await operation();
+                    resolve(result);
+                } catch (err) {
+                    reject(err);
+                } finally {
+                    keyOperationInProgress = false;
+                    if (keyOperationQueue.length > 0) {
+                        const next = keyOperationQueue.shift();
+                        next();
+                    }
+                }
+            };
+
+            if (keyOperationInProgress) {
+                keyOperationQueue.push(run);
+            } else {
+                run();
             }
-            return result;
+        });
+    };
+
+    const synchronizedKeys = {
+        get: async (type, ids) => {
+            return executeKeyOperation(async () => {
+                const result = await originalKeys.get(type, ids);
+                const foundCount = Object.keys(result).length;
+                if (type === 'session' || type === 'pre-key' || type === 'sender-key') {
+                    log(`🔑 KEY GET [${type}]: requested ${ids.length} keys, found ${foundCount}`, sessionId);
+                }
+                return result;
+            });
         },
         set: async (data) => {
-            const types = Object.keys(data);
-            for (const type of types) {
-                const count = Object.keys(data[type]).length;
-                if (type === 'session' || type === 'pre-key' || type === 'sender-key') {
-                    log(`🔑 KEY SET [${type}]: saving ${count} keys`, sessionId);
+            return executeKeyOperation(async () => {
+                const types = Object.keys(data);
+                for (const type of types) {
+                    const count = Object.keys(data[type]).length;
+                    if (type === 'session' || type === 'pre-key' || type === 'sender-key') {
+                        log(`🔑 KEY SET [${type}]: saving ${count} keys`, sessionId);
+                    }
                 }
-            }
-            await originalKeys.set(data);
-            // Force immediate credential save after key update
-            await saveCreds();
-            log(`🔑 KEY SET: credentials saved to disk`, sessionId);
+                await originalKeys.set(data);
+                // Force immediate credential save after key update
+                await saveCreds();
+                log(`🔑 KEY SET: credentials saved to disk`, sessionId);
+            });
         }
     };
 
@@ -963,7 +999,9 @@ async function connectToWhatsApp(sessionId) {
         version,
         auth: {
             creds: state.creds,
-            keys: makeCacheableSignalKeyStore(wrappedKeys, logger),
+            // 🔧 FIX: Use synchronized keys WITHOUT the cacheable wrapper
+            // This ensures we always read/write fresh keys from disk
+            keys: synchronizedKeys,
         },
         printQRInTerminal: false,
         logger,
