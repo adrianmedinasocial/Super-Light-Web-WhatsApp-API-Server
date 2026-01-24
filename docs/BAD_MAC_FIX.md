@@ -166,6 +166,97 @@ Si después de estos cambios el error "Bad MAC" continúa:
    - Asegurarse de que el volumen está correctamente montado
    - Verificar que los archivos persisten entre deploys
 
+---
+
+## Fix v2: Mutex Unificado (2025-01-23)
+
+### Problema Persistente
+Después de aplicar los fixes anteriores, el error Bad MAC continuaba porque:
+1. Había **dos mutexes separados**: uno para `saveCreds()` y otro para operaciones de claves
+2. Las operaciones no estaban completamente serializadas
+3. Cuando llegaba un prekey bundle, podía haber condiciones de carrera entre:
+   - Lectura de claves viejas
+   - Cierre de sesión
+   - Creación de nueva sesión
+   - Escritura de nuevas claves
+
+### Solución v2: Mutex Unificado
+
+**Archivo:** `index.js` (líneas 87-145)
+
+Se unificaron ambos mutexes en uno solo (`sessionMutexes`) que serializa **todas** las operaciones Signal:
+
+```javascript
+// ANTES: Dos mutexes separados
+const credsMutexes = new Map();  // Para saveCreds
+let keyOperationInProgress = false;  // Para keys (local a cada sesión)
+
+// DESPUÉS: Un solo mutex unificado
+const sessionMutexes = new Map();  // Para TODAS las operaciones Signal
+
+async function withSessionMutex(sessionId, operationName, fn) {
+    const mutex = getSessionMutex(sessionId);
+    // Serializa KEY_GET, KEY_SET, y saveCreds
+    // ...
+}
+```
+
+### Cambios en synchronizedKeys
+
+```javascript
+// ANTES: Mutex local separado
+const executeKeyOperation = async (operation) => { /* mutex local */ };
+
+// DESPUÉS: Usa el mutex global unificado
+const synchronizedKeys = {
+    get: async (type, ids) => {
+        return withSessionMutex(sessionId, `KEY_GET_${type}`, async () => {
+            // Lee claves
+        });
+    },
+    set: async (data) => {
+        return withSessionMutex(sessionId, 'KEY_SET', async () => {
+            await originalKeys.set(data);
+            await originalSaveCreds();  // Llama directamente, ya estamos en el mutex
+        });
+    }
+};
+```
+
+### Logs de Diagnóstico v2
+
+Con los nuevos cambios, verás estos logs adicionales:
+
+```
+[miadriancito] 🔒 Mutex: queuing KEY_GET_session (queue size: 1, waiting for: KEY_SET)
+[miadriancito] 🔒 Mutex op #42 (KEY_SET) took 150ms
+[miadriancito] 🔒 Mutex: 2 operations still queued
+```
+
+Esto indica:
+- Las operaciones se están serializando correctamente
+- Puedes ver cuántas operaciones están encoladas
+- Puedes ver qué operación está bloqueando
+
+### Si el Error Persiste Después de v2
+
+1. **Revisar logs de mutex:**
+   - Si ves "Mutex: queuing..." frecuentemente, las operaciones se están serializando
+   - Si NO ves estos logs y el error persiste, el problema está en otra parte
+
+2. **Problema con LIDs:**
+   - Si los mensajes vienen de `@lid`, el servidor no puede resolver el ID real
+   - Esto puede causar problemas con las sesiones Signal
+
+3. **Considerar actualizar Baileys:**
+   - La versión actual es 6.7.21
+   - Hay disponible 7.0.0-rc.9 que podría tener mejoras
+   - Nota: Es un release candidate, revisar changelog antes de actualizar
+
+4. **Eliminar sesión y empezar de nuevo:**
+   - A veces las sesiones Signal quedan irrecuperablemente corruptas
+   - Eliminar la carpeta de la sesión y escanear el QR de nuevo
+
 ## Commits Relacionados
 
 1. `d5fb4d7` - Add mutex and debounce to saveCreds
@@ -173,6 +264,7 @@ Si después de estos cambios el error "Bad MAC" continúa:
 3. `156cdfc` - Add ev.process() for synchronous event handling
 4. `a908f2d` - Reuse existing token on session restoration
 5. `14888f1` - Remove key caching and add mutex for Signal key operations
+6. `PENDIENTE` - Unify all Signal operation mutexes (v2 fix)
 
 ## Referencias
 

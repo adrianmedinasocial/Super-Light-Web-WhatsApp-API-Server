@@ -84,49 +84,74 @@ const msgRetryCounterCache = new NodeCache({
     useClones: false
 });
 
-// 🔧 FIX: Mutex system for saveCreds to prevent concurrent writes that corrupt Signal keys
-// This fixes the intermittent "Bad MAC" errors caused by race conditions
-const credsMutexes = new Map(); // Per-session mutex locks
-const credsWriteQueues = new Map(); // Pending writes per session
+// 🔧 FIX: UNIFIED Mutex system for ALL Signal key operations
+// This fixes "Bad MAC" errors by ensuring ALL key operations are serialized
+// The key insight: both key get/set AND saveCreds must use the SAME mutex
+// to prevent race conditions when prekey bundles arrive
+const sessionMutexes = new Map(); // UNIFIED per-session mutex locks
 
-// Simple mutex implementation for credential saving
-function createCredsMutex(sessionId) {
-    if (!credsMutexes.has(sessionId)) {
-        credsMutexes.set(sessionId, {
+// Create or get unified mutex for a session
+function getSessionMutex(sessionId) {
+    if (!sessionMutexes.has(sessionId)) {
+        sessionMutexes.set(sessionId, {
             locked: false,
-            queue: []
+            queue: [],
+            operationCount: 0,
+            lastOperation: null
         });
     }
-    return credsMutexes.get(sessionId);
+    return sessionMutexes.get(sessionId);
 }
 
-async function withCredsMutex(sessionId, fn) {
-    const mutex = createCredsMutex(sessionId);
+// Unified mutex wrapper - ALL signal operations must use this
+async function withSessionMutex(sessionId, operationName, fn) {
+    const mutex = getSessionMutex(sessionId);
 
     return new Promise((resolve, reject) => {
         const execute = async () => {
             mutex.locked = true;
+            mutex.operationCount++;
+            mutex.lastOperation = operationName;
+            const opNum = mutex.operationCount;
+            const startTime = Date.now();
+
             try {
                 const result = await fn();
+                const duration = Date.now() - startTime;
+                if (duration > 100) {
+                    console.log(`[${sessionId}] 🔒 Mutex op #${opNum} (${operationName}) took ${duration}ms`);
+                }
                 resolve(result);
             } catch (err) {
+                console.error(`[${sessionId}] ❌ Mutex operation #${opNum} (${operationName}) failed:`, err.message);
                 reject(err);
             } finally {
                 mutex.locked = false;
                 // Process next in queue
                 if (mutex.queue.length > 0) {
                     const next = mutex.queue.shift();
-                    next();
+                    const queueLen = mutex.queue.length;
+                    if (queueLen > 0) {
+                        console.log(`[${sessionId}] 🔒 Mutex: ${queueLen} operations still queued`);
+                    }
+                    setImmediate(next); // Use setImmediate to prevent stack overflow
                 }
             }
         };
 
         if (mutex.locked) {
+            const queueLen = mutex.queue.length;
+            console.log(`[${sessionId}] 🔒 Mutex: queuing ${operationName} (queue size: ${queueLen + 1}, waiting for: ${mutex.lastOperation})`);
             mutex.queue.push(execute);
         } else {
             execute();
         }
     });
+}
+
+// Backwards compatibility alias
+async function withCredsMutex(sessionId, fn) {
+    return withSessionMutex(sessionId, 'saveCreds', fn);
 }
 
 // Debounced saveCreds wrapper to batch rapid credential updates
@@ -937,39 +962,13 @@ async function connectToWhatsApp(sessionId) {
     // The makeCacheableSignalKeyStore cache can serve outdated keys causing Bad MAC errors
     const originalKeys = state.keys;
 
-    // Mutex for key operations to prevent concurrent read/write issues
-    let keyOperationInProgress = false;
-    const keyOperationQueue = [];
-
-    const executeKeyOperation = async (operation) => {
-        return new Promise((resolve, reject) => {
-            const run = async () => {
-                keyOperationInProgress = true;
-                try {
-                    const result = await operation();
-                    resolve(result);
-                } catch (err) {
-                    reject(err);
-                } finally {
-                    keyOperationInProgress = false;
-                    if (keyOperationQueue.length > 0) {
-                        const next = keyOperationQueue.shift();
-                        next();
-                    }
-                }
-            };
-
-            if (keyOperationInProgress) {
-                keyOperationQueue.push(run);
-            } else {
-                run();
-            }
-        });
-    };
-
+    // 🔧 FIX v2: Use the UNIFIED session mutex for ALL key operations
+    // This ensures key GET, key SET, and saveCreds are ALL serialized
+    // Critical for preventing Bad MAC when prekey bundles arrive
     const synchronizedKeys = {
         get: async (type, ids) => {
-            return executeKeyOperation(async () => {
+            // Use unified mutex for key reads
+            return withSessionMutex(sessionId, `KEY_GET_${type}`, async () => {
                 const result = await originalKeys.get(type, ids);
                 const foundCount = Object.keys(result).length;
                 if (type === 'session' || type === 'pre-key' || type === 'sender-key') {
@@ -979,7 +978,8 @@ async function connectToWhatsApp(sessionId) {
             });
         },
         set: async (data) => {
-            return executeKeyOperation(async () => {
+            // Use unified mutex for key writes - this MUST serialize with reads
+            return withSessionMutex(sessionId, 'KEY_SET', async () => {
                 const types = Object.keys(data);
                 for (const type of types) {
                     const count = Object.keys(data[type]).length;
@@ -989,7 +989,9 @@ async function connectToWhatsApp(sessionId) {
                 }
                 await originalKeys.set(data);
                 // Force immediate credential save after key update
-                await saveCreds();
+                // NOTE: saveCreds uses the same mutex via withCredsMutex,
+                // but we're already inside the mutex, so call originalSaveCreds directly
+                await originalSaveCreds();
                 log(`🔑 KEY SET: credentials saved to disk`, sessionId);
             });
         }
@@ -1581,10 +1583,10 @@ async function deleteSession(sessionId) {
         log(`🧹 Cleared message deduplication cache for session ${sessionId}`, sessionId);
     }
 
-    // 🔧 FIX: Clear credentials mutex for this session
-    if (credsMutexes.has(sessionId)) {
-        credsMutexes.delete(sessionId);
-        log(`🧹 Cleared credentials mutex for session ${sessionId}`, sessionId);
+    // 🔧 FIX: Clear unified session mutex for this session
+    if (sessionMutexes.has(sessionId)) {
+        sessionMutexes.delete(sessionId);
+        log(`🧹 Cleared session mutex for session ${sessionId}`, sessionId);
     }
 
     // Remove session ownership
