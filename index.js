@@ -18,8 +18,10 @@ const {
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
     isJidBroadcast,
-    Browsers
+    Browsers,
+    DisconnectReason
 } = require('@whiskeysockets/baileys');
+const NodeCache = require('node-cache');
 const pino = require('pino');
 const { Boom } = require('@hapi/boom');
 const express = require('express');
@@ -72,6 +74,15 @@ setInterval(() => {
 // This prevents memory leaks when sessions reconnect
 const sessionCleanupIntervals = new Map();
 const sessionProcessedMessages = new Map();
+
+// 🔧 FIX: Message retry counter cache - CRITICAL for handling Bad MAC errors
+// This cache stores retry counts for messages that fail to decrypt
+// Without this, Baileys can't properly handle message retries from WhatsApp
+const msgRetryCounterCache = new NodeCache({
+    stdTTL: 600, // 10 minutes TTL
+    checkperiod: 60, // Check for expired keys every 60 seconds
+    useClones: false
+});
 
 // Track WebSocket connections with their associated users
 const wsClients = new Map(); // Maps WebSocket client to user info
@@ -837,6 +848,9 @@ async function connectToWhatsApp(sessionId) {
         // Memory optimization settings
         markOnlineOnConnect: false,
         syncFullHistory: false,
+        // 🔧 FIX: Message retry counter cache - CRITICAL for Bad MAC handling
+        // This allows Baileys to track retry attempts and request message resends
+        msgRetryCounterCache,
         // Reduce message retry count
         retryRequestDelayMs: 2000,
         maxMsgRetryCount: 5,  // 🔧 Increased from 3 to 5 for better reliability
