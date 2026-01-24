@@ -75,6 +75,12 @@ setInterval(() => {
 const sessionCleanupIntervals = new Map();
 const sessionProcessedMessages = new Map();
 
+// 🔧 FIX v4: Global LID to Phone Number mapping
+// Baileys 6.7.21 doesn't have native LID mapping, so we maintain our own
+// This maps LID (e.g., "227599578050572@lid") to real phone (e.g., "5215547606478@s.whatsapp.net")
+const lidToPhoneMap = new Map();
+const LID_MAP_TTL = 24 * 60 * 60 * 1000; // 24 hours TTL for LID mappings
+
 // 🔧 FIX: Message retry counter cache - CRITICAL for handling Bad MAC errors
 // This cache stores retry counts for messages that fail to decrypt
 // Without this, Baileys can't properly handle message retries from WhatsApp
@@ -1050,8 +1056,9 @@ async function connectToWhatsApp(sessionId) {
         }
     });
 
-    // Also keep the regular listener as backup
-    sock.ev.on('creds.update', saveCreds);
+    // 🔧 FIX v4: REMOVED duplicate creds.update listener
+    // The ev.process() handler above already handles this, having both caused race conditions
+    // See docs/BAD_MAC_FIX.md for details
 
     // 🔧 FIX: Message deduplication cache - use global map per session
     const MESSAGE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes (aligned with backend)
@@ -1069,6 +1076,18 @@ async function connectToWhatsApp(sessionId) {
         if (cleaned > 0) {
             log(`🧹 Cleaned ${cleaned} expired messages from cache`, sessionId);
         }
+
+        // 🔧 FIX v4: Also clean old LID mappings (24 hour TTL)
+        let lidCleaned = 0;
+        for (const [lid, data] of lidToPhoneMap.entries()) {
+            if (now - data.timestamp > LID_MAP_TTL) {
+                lidToPhoneMap.delete(lid);
+                lidCleaned++;
+            }
+        }
+        if (lidCleaned > 0) {
+            log(`🧹 Cleaned ${lidCleaned} expired LID mappings from cache`, sessionId);
+        }
     }, 10 * 60 * 1000);
 
     // 🔧 FIX: Store cleanup interval in global map
@@ -1084,7 +1103,14 @@ async function connectToWhatsApp(sessionId) {
         if (isLID) {
             log(`⚠️ LID detected: ${from}`, sessionId);
 
-            // Option 1: Use Baileys' built-in LID mapping (most reliable)
+            // 🔧 FIX v4: Option 0 - Check our local LID cache FIRST (most reliable fallback)
+            const cachedPhone = lidToPhoneMap.get(from);
+            if (cachedPhone) {
+                from = cachedPhone.phone;
+                log(`🎯 LID resolved via LOCAL CACHE: ${from} (cached ${Math.round((Date.now() - cachedPhone.timestamp) / 1000)}s ago)`, sessionId);
+            }
+
+            // Option 1: Use Baileys' built-in LID mapping (if available)
             if (from.includes('@lid') && sock.signalRepository?.lidMapping) {
                 try {
                     const pn = await sock.signalRepository.lidMapping.getPNForLID(from);
@@ -1138,6 +1164,12 @@ async function connectToWhatsApp(sessionId) {
                     from = participant;
                     log(`🔄 LID resolved via documentMessage.contextInfo.participant: ${from}`, sessionId);
                 }
+            }
+
+            // 🔧 FIX v4: If we resolved the LID, save to cache for future use
+            if (!from.includes('@lid') && originalFrom.includes('@lid')) {
+                lidToPhoneMap.set(originalFrom, { phone: from, timestamp: Date.now() });
+                log(`💾 LID mapping saved: ${originalFrom} → ${from}`, sessionId);
             }
 
             // Still LID - log warning with more details
@@ -1203,21 +1235,26 @@ async function connectToWhatsApp(sessionId) {
             // 🔧 FIX: Extract real phone number (handles LID and groups)
             const { from, groupId, isGroup, isLID } = await extractRealPhoneNumber(msg, sessionId);
 
+            // 🔧 FIX v4: Keep track of original remoteJid for LID mapping
+            const originalRemoteJid = msg.key.remoteJid;
+            const wasLIDResolved = originalRemoteJid.includes('@lid') && !from.includes('@lid');
+
             // Detect message type and check for audio
             const msgTypeInfo = audioTranscriber.detectMessageType(msg);
-            log(`Received ${msgTypeInfo.type} message from ${from}${isGroup ? ` (group: ${groupId})` : ''}${isLID ? ' [LID-WARNING]' : ''}`, sessionId);
+            log(`Received ${msgTypeInfo.type} message from ${from}${isGroup ? ` (group: ${groupId})` : ''}${isLID ? ' [LID-WARNING]' : ''}${wasLIDResolved ? ' [LID-RESOLVED]' : ''}`, sessionId);
 
             // Base message data with resolved phone number
             const messageData = {
                 event: 'new-message',
                 sessionId,
                 from: from,  // Now contains resolved phone number
+                originalLID: originalRemoteJid.includes('@lid') ? originalRemoteJid : null,  // 🔧 v4: Include original LID for backend mapping
                 messageId: messageId,
                 timestamp: msg.messageTimestamp,
                 messageType: msgTypeInfo.type,
                 isGroup: isGroup,
                 groupId: groupId,
-                isLID: isLID,  // Flag to warn backend about LID
+                isLID: isLID,  // Flag to warn backend about unresolved LID
                 data: msg
             };
 

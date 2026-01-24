@@ -365,6 +365,97 @@ El sistema ahora reconoce estos tipos de contenido como "mensaje válido":
 
 ---
 
+## Fix v4: Mapeo de LID Persistente (2025-01-23)
+
+### Problema Descubierto
+Después de los fixes anteriores, se descubrió que **el mismo usuario aparecía como dos conversaciones diferentes** en el backend:
+- Conversación 1: `5215547606478@s.whatsapp.net` (número real)
+- Conversación 2: `227599578050572@lid` (LID no resuelto)
+
+**Causa raíz:**
+1. Baileys 6.7.21 **no tiene soporte nativo de LID mapping** (`signalRepository.lidMapping` no existe)
+2. Cuando hay Bad MAC, el mensaje llega sin `contextInfo` ni `participant`, por lo que el LID no se puede resolver
+3. Había un **listener duplicado** de `creds.update` que causaba race conditions
+
+### Solución v4: Dos Cambios
+
+#### Cambio 1: Eliminar Listener Duplicado
+**Archivo:** `index.js`
+
+```javascript
+// ANTES: Dos listeners (causaba race conditions)
+sock.ev.process(async (events) => {
+    if (events['creds.update']) { await saveCreds(); }
+});
+sock.ev.on('creds.update', saveCreds);  // DUPLICADO!
+
+// DESPUÉS: Solo un listener
+sock.ev.process(async (events) => {
+    if (events['creds.update']) { await saveCreds(); }
+});
+// Listener duplicado ELIMINADO
+```
+
+#### Cambio 2: Cache Local de LID → Número Real
+**Archivo:** `index.js`
+
+Se implementó un mapa global `lidToPhoneMap` que:
+1. Guarda la relación LID → número real cuando un mensaje se resuelve correctamente
+2. Consulta el cache PRIMERO cuando llega un mensaje con LID
+3. Se limpia automáticamente después de 24 horas
+
+```javascript
+// Mapa global
+const lidToPhoneMap = new Map();
+const LID_MAP_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+// En extractRealPhoneNumber():
+// 1. Primero busca en cache local
+const cachedPhone = lidToPhoneMap.get(from);
+if (cachedPhone) {
+    from = cachedPhone.phone;
+    log(`🎯 LID resolved via LOCAL CACHE: ${from}`);
+}
+
+// 2. Si se resuelve por otro método, guarda en cache
+if (!from.includes('@lid') && originalFrom.includes('@lid')) {
+    lidToPhoneMap.set(originalFrom, { phone: from, timestamp: Date.now() });
+    log(`💾 LID mapping saved: ${originalFrom} → ${from}`);
+}
+```
+
+### Logs de Diagnóstico v4
+
+Con los nuevos cambios, verás estos logs:
+
+```
+[sessionId] 🎯 LID resolved via LOCAL CACHE: 5215547606478@s.whatsapp.net (cached 45s ago)
+[sessionId] 💾 LID mapping saved: 227599578050572@lid → 5215547606478@s.whatsapp.net
+[sessionId] 🧹 Cleaned 3 expired LID mappings from cache
+```
+
+### Payload del Webhook v4
+
+El webhook ahora incluye `originalLID` para que el backend pueda mantener su propio mapeo:
+
+```json
+{
+  "event": "new-message",
+  "from": "5215547606478@s.whatsapp.net",
+  "originalLID": "227599578050572@lid",
+  "isLID": false,
+  ...
+}
+```
+
+### Limitación Conocida
+
+El cache solo funciona **después** de que un mensaje con número real resuelto haya llegado. Si el primer mensaje de un usuario tiene Bad MAC y no se puede resolver, el backend recibirá el LID.
+
+**Recomendación:** El backend debería mantener su propio mapeo LID → número usando el campo `originalLID` del webhook para unificar conversaciones.
+
+---
+
 ## Commits Relacionados
 
 1. `d5fb4d7` - Add mutex and debounce to saveCreds
@@ -374,6 +465,7 @@ El sistema ahora reconoce estos tipos de contenido como "mensaje válido":
 5. `14888f1` - Remove key caching and add mutex for Signal key operations
 6. `1456d7e` - Unify all Signal operation mutexes (v2 fix)
 7. `e33843d` - Don't mark failed decryption messages as processed (v3 fix)
+8. `TBD` - Remove duplicate creds.update listener + LID cache (v4 fix)
 
 ## Referencias
 
