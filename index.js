@@ -371,8 +371,15 @@ wss.on('connection', (ws, req) => {
 });
 
 // Use file-based session store for production
+// 🔧 FIX: Ensure sessions directory exists for session-file-store
+const EXPRESS_SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
+if (!fs.existsSync(EXPRESS_SESSIONS_DIR)) {
+    fs.mkdirSync(EXPRESS_SESSIONS_DIR, { recursive: true });
+    console.log(`📁 Created Express sessions directory: ${EXPRESS_SESSIONS_DIR}`);
+}
+
 const sessionStore = new FileStore({
-    path: './sessions',
+    path: EXPRESS_SESSIONS_DIR,
     ttl: 86400, // 1 day
     retries: 3,
     secret: process.env.SESSION_SECRET || 'change_this_secret'
