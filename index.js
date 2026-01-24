@@ -84,6 +84,84 @@ const msgRetryCounterCache = new NodeCache({
     useClones: false
 });
 
+// 🔧 FIX: Mutex system for saveCreds to prevent concurrent writes that corrupt Signal keys
+// This fixes the intermittent "Bad MAC" errors caused by race conditions
+const credsMutexes = new Map(); // Per-session mutex locks
+const credsWriteQueues = new Map(); // Pending writes per session
+
+// Simple mutex implementation for credential saving
+function createCredsMutex(sessionId) {
+    if (!credsMutexes.has(sessionId)) {
+        credsMutexes.set(sessionId, {
+            locked: false,
+            queue: []
+        });
+    }
+    return credsMutexes.get(sessionId);
+}
+
+async function withCredsMutex(sessionId, fn) {
+    const mutex = createCredsMutex(sessionId);
+
+    return new Promise((resolve, reject) => {
+        const execute = async () => {
+            mutex.locked = true;
+            try {
+                const result = await fn();
+                resolve(result);
+            } catch (err) {
+                reject(err);
+            } finally {
+                mutex.locked = false;
+                // Process next in queue
+                if (mutex.queue.length > 0) {
+                    const next = mutex.queue.shift();
+                    next();
+                }
+            }
+        };
+
+        if (mutex.locked) {
+            mutex.queue.push(execute);
+        } else {
+            execute();
+        }
+    });
+}
+
+// Debounced saveCreds wrapper to batch rapid credential updates
+function createDebouncedSaveCreds(sessionId, originalSaveCreds, delay = 500) {
+    let timeout = null;
+    let pendingPromise = null;
+    let pendingResolvers = [];
+
+    return async () => {
+        return new Promise((resolve, reject) => {
+            pendingResolvers.push({ resolve, reject });
+
+            if (timeout) {
+                clearTimeout(timeout);
+            }
+
+            timeout = setTimeout(async () => {
+                const resolvers = [...pendingResolvers];
+                pendingResolvers = [];
+                timeout = null;
+
+                try {
+                    await withCredsMutex(sessionId, async () => {
+                        await originalSaveCreds();
+                    });
+                    resolvers.forEach(r => r.resolve());
+                } catch (err) {
+                    console.error(`[${sessionId}] Error saving credentials:`, err.message);
+                    resolvers.forEach(r => r.reject(err));
+                }
+            }, delay);
+        });
+    };
+}
+
 // Track WebSocket connections with their associated users
 const wsClients = new Map(); // Maps WebSocket client to user info
 
@@ -824,7 +902,13 @@ async function connectToWhatsApp(sessionId) {
         fs.mkdirSync(sessionDir, { recursive: true });
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const { state, saveCreds: originalSaveCreds } = await useMultiFileAuthState(sessionDir);
+
+    // 🔧 FIX: Wrap saveCreds with debounce + mutex to prevent concurrent writes
+    // This fixes intermittent "Bad MAC" errors caused by Signal key corruption
+    const saveCreds = createDebouncedSaveCreds(sessionId, originalSaveCreds, 300);
+    log(`🔐 Initialized debounced credential saver for session`, sessionId);
+
     const { version, isLatest } = await fetchLatestBaileysVersion();
     log(`Using WA version: ${version.join('.')}, isLatest: ${isLatest}`, sessionId);
 
@@ -1397,6 +1481,12 @@ async function deleteSession(sessionId) {
         sessionProcessedMessages.get(sessionId).clear();
         sessionProcessedMessages.delete(sessionId);
         log(`🧹 Cleared message deduplication cache for session ${sessionId}`, sessionId);
+    }
+
+    // 🔧 FIX: Clear credentials mutex for this session
+    if (credsMutexes.has(sessionId)) {
+        credsMutexes.delete(sessionId);
+        log(`🧹 Cleared credentials mutex for session ${sessionId}`, sessionId);
     }
 
     // Remove session ownership
