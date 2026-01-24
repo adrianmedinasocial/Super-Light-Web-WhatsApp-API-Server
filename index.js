@@ -48,6 +48,31 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+// 🔧 FIX: Global message store for retry requests (prevents "Bad MAC" errors)
+// This stores sent messages so Baileys can re-encrypt them when WhatsApp requests a retry
+const globalMessageStore = new Map();
+const MESSAGE_STORE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// Cleanup old messages from store every 2 minutes
+setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [key, value] of globalMessageStore.entries()) {
+        if (now - value.timestamp > MESSAGE_STORE_TTL) {
+            globalMessageStore.delete(key);
+            cleaned++;
+        }
+    }
+    if (cleaned > 0) {
+        console.log(`[MESSAGE-STORE] Cleaned ${cleaned} expired messages from retry store`);
+    }
+}, 2 * 60 * 1000);
+
+// 🔧 FIX: Global storage for cleanup intervals and processed messages per session
+// This prevents memory leaks when sessions reconnect
+const sessionCleanupIntervals = new Map();
+const sessionProcessedMessages = new Map();
+
 // Track WebSocket connections with their associated users
 const wsClients = new Map(); // Maps WebSocket client to user info
 
@@ -66,10 +91,24 @@ console.log(`📁 Data directory: ${DATA_DIR}`);
 console.log(`📁 Sessions directory: ${SESSIONS_DIR}`);
 
 // Encryption key - MUST be stored in .env file
-const ENCRYPTION_KEY = process.env.TOKEN_ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
+// 🔧 FIX: Make encryption key MANDATORY in production to prevent session loss on restart
+let ENCRYPTION_KEY;
 if (!process.env.TOKEN_ENCRYPTION_KEY) {
-    console.warn('⚠️  WARNING: Using random encryption key. Set TOKEN_ENCRYPTION_KEY in .env file!');
-    console.warn(`Add this to your .env file: TOKEN_ENCRYPTION_KEY=${ENCRYPTION_KEY}`);
+    if (process.env.NODE_ENV === 'production') {
+        console.error('❌ FATAL ERROR: TOKEN_ENCRYPTION_KEY not set!');
+        console.error('   Without this key, all sessions will be lost on restart.');
+        console.error('   Generate a key with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+        console.error('   Then add to environment: TOKEN_ENCRYPTION_KEY=<your_key>');
+        process.exit(1);
+    } else {
+        // In development, generate a random key but warn loudly
+        ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');
+        console.warn('⚠️  WARNING: TOKEN_ENCRYPTION_KEY not set - using random key for development.');
+        console.warn('   Sessions will be lost on restart!');
+        console.warn(`   Add to .env: TOKEN_ENCRYPTION_KEY=${ENCRYPTION_KEY}`);
+    }
+} else {
+    ENCRYPTION_KEY = process.env.TOKEN_ENCRYPTION_KEY;
 }
 
 // Initialize user management and activity logging
@@ -558,7 +597,7 @@ app.post('/admin/update-logs', requireAdminAuth, express.json(), (req, res) => {
     }
 });
 
-const v1ApiRouter = initializeApi(sessions, sessionTokens, createSession, getSessionsDetails, deleteSession, deleteAllSessions, log, userManager, activityLogger);
+const v1ApiRouter = initializeApi(sessions, sessionTokens, createSession, getSessionsDetails, deleteSession, deleteAllSessions, log, userManager, activityLogger, globalMessageStore);
 const legacyApiRouter = initializeLegacyApi(sessions, sessionTokens);
 app.use('/api/v1', v1ApiRouter);
 app.use('/api', legacyApiRouter); // Mount legacy routes at /api
@@ -695,19 +734,37 @@ app.get('/api/v1/logs/export', requireAdminAuth, (req, res) => {
     res.send(JSON.stringify(systemLog, null, 2));
 });
 
-// Update postToWebhook to accept sessionId and use getWebhookUrl(sessionId)
-async function postToWebhook(data) {
+// 🔧 FIX: Update postToWebhook with retry logic and exponential backoff
+async function postToWebhook(data, retryCount = 0) {
+    const MAX_RETRIES = 3;
+    const BASE_DELAY = 2000; // 2 seconds base delay
     const sessionId = data.sessionId || 'SYSTEM';
     const webhookUrl = getWebhookUrl(sessionId);
     if (!webhookUrl) return;
 
     try {
         await axios.post(webhookUrl, data, {
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 30000 // 30 second timeout
         });
         log(`Successfully posted to webhook: ${webhookUrl}`);
     } catch (error) {
-        log(`Failed to post to webhook: ${error.message}`);
+        const isRetryable = error.code === 'ECONNRESET' ||
+            error.code === 'ETIMEDOUT' ||
+            error.code === 'ECONNABORTED' ||
+            (error.response && error.response.status >= 500);
+
+        if (isRetryable && retryCount < MAX_RETRIES) {
+            const delay = BASE_DELAY * Math.pow(2, retryCount); // Exponential backoff: 2s, 4s, 8s
+            log(`⚠️ Webhook failed (attempt ${retryCount + 1}/${MAX_RETRIES}), retrying in ${delay}ms: ${error.message}`);
+            setTimeout(() => postToWebhook(data, retryCount + 1), delay);
+        } else if (retryCount >= MAX_RETRIES) {
+            log(`❌ Webhook failed after ${MAX_RETRIES} attempts: ${error.message}`);
+            // Log the failed message data for potential manual recovery
+            log(`   Failed message data: event=${data.event}, sessionId=${sessionId}, messageId=${data.messageId || 'N/A'}`);
+        } else {
+            log(`❌ Webhook failed (non-retryable): ${error.message}`);
+        }
     }
 }
 
@@ -738,6 +795,18 @@ function updateSessionState(sessionId, status, detail, qr, reason) {
 async function connectToWhatsApp(sessionId) {
     updateSessionState(sessionId, 'CONNECTING', 'Initializing session...', '', '');
     log('Starting session...', sessionId);
+
+    // 🔧 FIX: Clear any existing cleanup interval for this session (prevents memory leaks on reconnect)
+    if (sessionCleanupIntervals.has(sessionId)) {
+        clearInterval(sessionCleanupIntervals.get(sessionId));
+        log(`🧹 Cleared previous cleanup interval for session ${sessionId}`, sessionId);
+    }
+
+    // 🔧 FIX: Reuse or create processedMessages map for this session
+    if (!sessionProcessedMessages.has(sessionId)) {
+        sessionProcessedMessages.set(sessionId, new Map());
+    }
+    const processedMessages = sessionProcessedMessages.get(sessionId);
 
     const sessionDir = path.join(SESSIONS_DIR, sessionId);
     if (!fs.existsSync(sessionDir)) {
@@ -779,19 +848,25 @@ async function connectToWhatsApp(sessionId) {
         emitOwnEvents: false,
         // 🔧 Additional settings for better Android/iPhone compatibility
         defaultQueryTimeoutMs: 60000,
+        // 🔧 FIX: Implement getMessage to support retry requests (prevents "Bad MAC" errors)
         getMessage: async (key) => {
-            // Return undefined to indicate message not found in cache
+            const msgKey = `${sessionId}_${key.remoteJid}_${key.id}`;
+            const stored = globalMessageStore.get(msgKey);
+            if (stored) {
+                log(`📦 getMessage: Found message in store for retry: ${key.id}`, sessionId);
+                return stored.message;
+            }
+            log(`⚠️ getMessage: Message not found in store: ${key.id}`, sessionId);
             return undefined;
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // 🔧 FIX: Message deduplication cache to prevent duplicate webhook posts
-    const processedMessages = new Map();
+    // 🔧 FIX: Message deduplication cache - use global map per session
     const MESSAGE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes (aligned with backend)
 
-    // Cleanup old messages every 10 minutes to prevent memory leaks
+    // 🔧 FIX: Store cleanup interval in global map to prevent duplicates
     const cleanupInterval = setInterval(() => {
         const now = Date.now();
         let cleaned = 0;
@@ -806,9 +881,13 @@ async function connectToWhatsApp(sessionId) {
         }
     }, 10 * 60 * 1000);
 
+    // 🔧 FIX: Store cleanup interval in global map
+    sessionCleanupIntervals.set(sessionId, cleanupInterval);
+
     // 🔧 FIX: Helper function to extract real phone number from message (handles LID)
     async function extractRealPhoneNumber(msg, sessionId) {
         let from = msg.key.remoteJid;
+        const originalFrom = from; // Keep original for logging
         const isLID = from && from.includes('@lid');
         const isGroup = from && from.includes('@g.us');
 
@@ -816,7 +895,7 @@ async function connectToWhatsApp(sessionId) {
             log(`⚠️ LID detected: ${from}`, sessionId);
 
             // Option 1: Use Baileys' built-in LID mapping (most reliable)
-            if (sock.signalRepository?.lidMapping) {
+            if (from.includes('@lid') && sock.signalRepository?.lidMapping) {
                 try {
                     const pn = await sock.signalRepository.lidMapping.getPNForLID(from);
                     if (pn && pn.includes('@s.whatsapp.net')) {
@@ -828,26 +907,53 @@ async function connectToWhatsApp(sessionId) {
                 }
             }
 
+            // 🔧 FIX: Changed else if to independent if statements so ALL options are tried
             // Option 2: Check for participant (in groups or as sender)
             if (from.includes('@lid') && msg.key.participant && msg.key.participant.includes('@s.whatsapp.net')) {
                 from = msg.key.participant;
                 log(`🔄 LID resolved via participant: ${from}`, sessionId);
             }
-            // Option 3: Check message object for alternative fields
-            else if (from.includes('@lid') && msg.message && msg.message.extendedTextMessage?.contextInfo?.participant) {
-                from = msg.message.extendedTextMessage.contextInfo.participant;
-                log(`🔄 LID resolved via contextInfo.participant: ${from}`, sessionId);
-            }
-            // Option 4: Check other message types for sender info
-            else if (from.includes('@lid') && msg.message && msg.message.conversation && msg.pushName) {
-                // Still LID but we have a push name - log for debugging
-                log(`⚠️ LID with pushName: ${msg.pushName}`, sessionId);
+
+            // Option 3: Check message object for alternative fields (extendedTextMessage)
+            if (from.includes('@lid') && msg.message?.extendedTextMessage?.contextInfo?.participant) {
+                const participant = msg.message.extendedTextMessage.contextInfo.participant;
+                if (participant.includes('@s.whatsapp.net')) {
+                    from = participant;
+                    log(`🔄 LID resolved via contextInfo.participant: ${from}`, sessionId);
+                }
             }
 
-            // Still LID - log warning
+            // Option 4: Check imageMessage contextInfo
+            if (from.includes('@lid') && msg.message?.imageMessage?.contextInfo?.participant) {
+                const participant = msg.message.imageMessage.contextInfo.participant;
+                if (participant.includes('@s.whatsapp.net')) {
+                    from = participant;
+                    log(`🔄 LID resolved via imageMessage.contextInfo.participant: ${from}`, sessionId);
+                }
+            }
+
+            // Option 5: Check audioMessage contextInfo
+            if (from.includes('@lid') && msg.message?.audioMessage?.contextInfo?.participant) {
+                const participant = msg.message.audioMessage.contextInfo.participant;
+                if (participant.includes('@s.whatsapp.net')) {
+                    from = participant;
+                    log(`🔄 LID resolved via audioMessage.contextInfo.participant: ${from}`, sessionId);
+                }
+            }
+
+            // Option 6: Check documentMessage contextInfo
+            if (from.includes('@lid') && msg.message?.documentMessage?.contextInfo?.participant) {
+                const participant = msg.message.documentMessage.contextInfo.participant;
+                if (participant.includes('@s.whatsapp.net')) {
+                    from = participant;
+                    log(`🔄 LID resolved via documentMessage.contextInfo.participant: ${from}`, sessionId);
+                }
+            }
+
+            // Still LID - log warning with more details
             if (from.includes('@lid')) {
-                log(`❌ WARNING: Could not resolve LID ${from}. Message may not be delivered correctly to backend.`, sessionId);
-                log(`   Message details: pushName=${msg.pushName}, hasParticipant=${!!msg.key.participant}`, sessionId);
+                log(`❌ WARNING: Could not resolve LID ${originalFrom}. Message may not be delivered correctly to backend.`, sessionId);
+                log(`   Message details: pushName=${msg.pushName}, hasParticipant=${!!msg.key.participant}, messageType=${Object.keys(msg.message || {})[0] || 'unknown'}`, sessionId);
             }
         }
 
@@ -1034,13 +1140,17 @@ async function connectToWhatsApp(sessionId) {
                 log(`⛔ Max retry limit reached (${MAX_RETRIES} attempts). Stopping reconnection.`, sessionId);
                 updateSessionState(sessionId, 'DISCONNECTED', `Connection failed after ${MAX_RETRIES} attempts. Please delete and recreate the session.`, '', reason);
 
-                // 🔧 FIX: Cleanup message cache and intervals
-                if (cleanupInterval) {
-                    clearInterval(cleanupInterval);
+                // 🔧 FIX: Cleanup message cache and intervals using global maps
+                if (sessionCleanupIntervals.has(sessionId)) {
+                    clearInterval(sessionCleanupIntervals.get(sessionId));
+                    sessionCleanupIntervals.delete(sessionId);
                     log(`🧹 Cleared cleanup interval for session ${sessionId}`, sessionId);
                 }
-                processedMessages.clear();
-                log(`🧹 Cleared message deduplication cache for session ${sessionId}`, sessionId);
+                if (sessionProcessedMessages.has(sessionId)) {
+                    sessionProcessedMessages.get(sessionId).clear();
+                    sessionProcessedMessages.delete(sessionId);
+                    log(`🧹 Cleared message deduplication cache for session ${sessionId}`, sessionId);
+                }
 
                 // Clean up session data
                 const sessionDir = path.join(SESSIONS_DIR, sessionId);
@@ -1101,13 +1211,18 @@ async function connectToWhatsApp(sessionId) {
             } else {
                 log(`⛔ Not reconnecting for session ${sessionId} due to fatal error (${statusCode}). Please delete and recreate the session.`, sessionId);
 
-                // 🔧 FIX: Cleanup message cache and intervals
-                if (cleanupInterval) {
-                    clearInterval(cleanupInterval);
+                // 🔧 FIX: Cleanup message cache and intervals using global maps
+                if (sessionCleanupIntervals.has(sessionId)) {
+                    clearInterval(sessionCleanupIntervals.get(sessionId));
+                    sessionCleanupIntervals.delete(sessionId);
                     log(`🧹 Cleared cleanup interval for session ${sessionId}`, sessionId);
                 }
-                processedMessages.clear();
-                log(`🧹 Cleared message deduplication cache (${processedMessages.size} messages) for session ${sessionId}`, sessionId);
+                if (sessionProcessedMessages.has(sessionId)) {
+                    const msgCount = sessionProcessedMessages.get(sessionId).size;
+                    sessionProcessedMessages.get(sessionId).clear();
+                    sessionProcessedMessages.delete(sessionId);
+                    log(`🧹 Cleared message deduplication cache (${msgCount} messages) for session ${sessionId}`, sessionId);
+                }
 
                 const sessionDir = path.join(SESSIONS_DIR, sessionId);
                 if (fs.existsSync(sessionDir)) {
@@ -1238,12 +1353,36 @@ app.get('/api/v1/sessions/:sessionId/qr', async (req, res) => {
 
 async function deleteSession(sessionId) {
     const session = sessions.get(sessionId);
+
+    // 🔧 FIX: Clean up event listeners and intervals BEFORE logout
     if (session && session.sock) {
+        try {
+            // Remove all event listeners to prevent memory leaks
+            session.sock.ev.removeAllListeners();
+            log(`🧹 Removed all event listeners for session ${sessionId}`, sessionId);
+        } catch (err) {
+            log(`Warning: Could not remove event listeners for ${sessionId}: ${err.message}`, sessionId);
+        }
+
         try {
             await session.sock.logout();
         } catch (err) {
             log(`Error during logout for session ${sessionId}: ${err.message}`, sessionId);
         }
+    }
+
+    // 🔧 FIX: Clear cleanup interval for this session
+    if (sessionCleanupIntervals.has(sessionId)) {
+        clearInterval(sessionCleanupIntervals.get(sessionId));
+        sessionCleanupIntervals.delete(sessionId);
+        log(`🧹 Cleared cleanup interval for session ${sessionId}`, sessionId);
+    }
+
+    // 🔧 FIX: Clear processed messages cache for this session
+    if (sessionProcessedMessages.has(sessionId)) {
+        sessionProcessedMessages.get(sessionId).clear();
+        sessionProcessedMessages.delete(sessionId);
+        log(`🧹 Cleared message deduplication cache for session ${sessionId}`, sessionId);
     }
 
     // Remove session ownership

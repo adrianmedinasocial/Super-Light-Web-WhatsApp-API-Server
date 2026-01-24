@@ -29,7 +29,12 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-function initializeApi(sessions, sessionTokens, createSession, getSessionsDetails, deleteSession, deleteAllSessions, log, userManager, activityLogger) {
+// 🔧 FIX: Global message store reference (passed from index.js)
+let globalMessageStore = null;
+
+function initializeApi(sessions, sessionTokens, createSession, getSessionsDetails, deleteSession, deleteAllSessions, log, userManager, activityLogger, messageStore) {
+    // 🔧 FIX: Store reference to global message store for retry support
+    globalMessageStore = messageStore;
     // Security middlewares
     router.use(helmet());
     
@@ -828,10 +833,21 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         }
     });
 
-    async function sendMessage(sock, to, message) {
+    async function sendMessage(sock, to, message, sessionId = null) {
         try {
             const jid = jidNormalizedUser(to);
             const result = await sock.sendMessage(jid, message);
+
+            // 🔧 FIX: Store sent message for retry support (prevents "Bad MAC" errors)
+            if (globalMessageStore && result?.key?.id) {
+                const msgKey = `${sessionId || 'unknown'}_${jid}_${result.key.id}`;
+                globalMessageStore.set(msgKey, {
+                    message: message,
+                    timestamp: Date.now()
+                });
+                console.log(`[MESSAGE-STORE] Stored outgoing message: ${result.key.id}`);
+            }
+
             return { status: 'success', message: `Message sent to ${to}`, messageId: result.key.id };
         } catch (error) {
             console.error(`Failed to send message to ${to}:`, error);
@@ -1030,7 +1046,7 @@ if (recipient_type === 'group') {
                         throw new Error(`Unsupported message type: ${type}`);
                 }
 
-                const result = await sendMessage(session.sock, destination, messagePayload);
+                const result = await sendMessage(session.sock, destination, messagePayload, sessionId);
                 results.push(result);
 
             } catch (error) {
