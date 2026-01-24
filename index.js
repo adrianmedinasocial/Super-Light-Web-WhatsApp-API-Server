@@ -1163,14 +1163,42 @@ async function connectToWhatsApp(sessionId) {
         if (!msg.key.fromMe) {
             const messageId = msg.key.id;
 
-            // 🔧 FIX: Check for duplicate messages
-            if (processedMessages.has(messageId)) {
-                log(`⚠️ Duplicate message detected and skipped: ${messageId}`, sessionId);
-                return; // Skip processing duplicate
-            }
+            // 🔧 FIX v3: Check if message was decrypted successfully
+            // When Bad MAC occurs, msg.message is empty or has senderKeyDistributionMessage only
+            const messageContent = msg.message;
+            const hasRealContent = messageContent && (
+                messageContent.conversation ||
+                messageContent.extendedTextMessage ||
+                messageContent.imageMessage ||
+                messageContent.videoMessage ||
+                messageContent.audioMessage ||
+                messageContent.documentMessage ||
+                messageContent.stickerMessage ||
+                messageContent.contactMessage ||
+                messageContent.locationMessage ||
+                messageContent.reactionMessage ||
+                messageContent.pollCreationMessage ||
+                messageContent.listMessage ||
+                messageContent.buttonsMessage ||
+                messageContent.templateMessage
+            );
 
-            // Mark message as processed
-            processedMessages.set(messageId, Date.now());
+            // If message failed to decrypt (no real content), don't mark as processed
+            // This allows the retry to be processed when it arrives
+            if (!hasRealContent) {
+                const msgType = messageContent ? Object.keys(messageContent)[0] : 'empty';
+                log(`⚠️ Message ${messageId} has no decryptable content (type: ${msgType}), skipping dedup registration`, sessionId);
+                // Still process the event for retry handling, but don't mark as processed
+            } else {
+                // 🔧 FIX: Check for duplicate messages (only for successfully decrypted messages)
+                if (processedMessages.has(messageId)) {
+                    log(`⚠️ Duplicate message detected and skipped: ${messageId}`, sessionId);
+                    return; // Skip processing duplicate
+                }
+
+                // Mark message as processed (only if it has real content)
+                processedMessages.set(messageId, Date.now());
+            }
 
             // 🔧 FIX: Extract real phone number (handles LID and groups)
             const { from, groupId, isGroup, isLID } = await extractRealPhoneNumber(msg, sessionId);
@@ -1260,7 +1288,13 @@ async function connectToWhatsApp(sessionId) {
                 }
             }
 
-            await postToWebhook(messageData);
+            // 🔧 FIX v3: Only send to webhook if message has real content
+            // Don't send failed decryption attempts to backend
+            if (hasRealContent) {
+                await postToWebhook(messageData);
+            } else {
+                log(`⏭️ Skipping webhook for message ${messageId} - no decryptable content (waiting for retry)`, sessionId);
+            }
         }
     });
 
