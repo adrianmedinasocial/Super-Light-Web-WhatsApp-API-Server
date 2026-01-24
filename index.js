@@ -966,6 +966,16 @@ async function connectToWhatsApp(sessionId) {
         }
     });
 
+    // 🔧 FIX: Use ev.process() to handle events synchronously
+    // This prevents race conditions that cause "Bad MAC" errors
+    sock.ev.process(async (events) => {
+        // Handle credential updates first (most critical for Signal keys)
+        if (events['creds.update']) {
+            await saveCreds();
+        }
+    });
+
+    // Also keep the regular listener as backup
     sock.ev.on('creds.update', saveCreds);
 
     // 🔧 FIX: Message deduplication cache - use global map per session
