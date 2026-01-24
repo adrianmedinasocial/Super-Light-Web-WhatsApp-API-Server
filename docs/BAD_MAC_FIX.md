@@ -257,6 +257,114 @@ Esto indica:
    - A veces las sesiones Signal quedan irrecuperablemente corruptas
    - Eliminar la carpeta de la sesión y escanear el QR de nuevo
 
+---
+
+## Fix v3: Deduplicación Inteligente (2025-01-23)
+
+### Problema Descubierto
+Después del fix v2, se descubrió un problema crítico: **algunos mensajes nunca llegaban al backend**.
+
+**Patrón observado:**
+```
+📱 Celular envía "papi" → ❌ Nunca llega al backend
+📱 Celular envía "mami" → ✅ Llega correctamente
+```
+
+**Causa raíz:**
+Cuando un mensaje fallaba con Bad MAC, el sistema de deduplicación lo marcaba como "procesado" aunque no se había desencriptado. Cuando WhatsApp reenviaba el mensaje después del retry request, el código lo detectaba como duplicado y lo descartaba.
+
+**Flujo problemático:**
+1. Mensaje "papi" llega → Bad MAC → falla desencriptar
+2. Código marca `messageId` como procesado (ERROR!)
+3. Baileys envía retry request a WhatsApp
+4. WhatsApp reenvía "papi"
+5. Código ve que `messageId` ya está procesado → **DESCARTA EL MENSAJE**
+6. "papi" nunca llega al backend
+
+### Solución v3: Verificación de Contenido
+
+**Archivo:** `index.js` (evento `messages.upsert`)
+
+Ahora se verifica si el mensaje tiene contenido real antes de marcarlo como procesado:
+
+```javascript
+// 🔧 FIX v3: Check if message was decrypted successfully
+const messageContent = msg.message;
+const hasRealContent = messageContent && (
+    messageContent.conversation ||
+    messageContent.extendedTextMessage ||
+    messageContent.imageMessage ||
+    messageContent.videoMessage ||
+    messageContent.audioMessage ||
+    messageContent.documentMessage ||
+    // ... otros tipos de mensaje
+);
+
+// Si no tiene contenido real, NO marcar como procesado
+if (!hasRealContent) {
+    log(`⚠️ Message ${messageId} has no decryptable content, skipping dedup`);
+    // Permite que el retry sea procesado cuando llegue
+} else {
+    // Solo marcar como procesado si tiene contenido real
+    if (processedMessages.has(messageId)) {
+        return; // Skip duplicate
+    }
+    processedMessages.set(messageId, Date.now());
+}
+
+// Solo enviar al webhook si tiene contenido real
+if (hasRealContent) {
+    await postToWebhook(messageData);
+} else {
+    log(`⏭️ Skipping webhook - waiting for retry`);
+}
+```
+
+### Logs de Diagnóstico v3
+
+Con los nuevos cambios, verás estos logs cuando un mensaje falla:
+
+```
+[miadriancito] ⚠️ Message ABC123 has no decryptable content (type: senderKeyDistributionMessage), skipping dedup registration
+[miadriancito] ⏭️ Skipping webhook for message ABC123 - no decryptable content (waiting for retry)
+```
+
+Y cuando llega el retry:
+
+```
+[miadriancito] 🔑 KEY GET [session]: requested 1 keys, found 1
+[miadriancito] Received text message from 5215547606478@s.whatsapp.net
+[SYSTEM] Successfully posted to webhook
+```
+
+### Tipos de Mensaje Reconocidos
+
+El sistema ahora reconoce estos tipos de contenido como "mensaje válido":
+- `conversation` - Texto simple
+- `extendedTextMessage` - Texto con formato/links
+- `imageMessage` - Imágenes
+- `videoMessage` - Videos
+- `audioMessage` - Audio/notas de voz
+- `documentMessage` - Documentos
+- `stickerMessage` - Stickers
+- `contactMessage` - Contactos
+- `locationMessage` - Ubicaciones
+- `reactionMessage` - Reacciones
+- `pollCreationMessage` - Encuestas
+- `listMessage` - Listas
+- `buttonsMessage` - Botones
+- `templateMessage` - Templates
+
+### Resumen de Cambios v3
+
+| Antes | Después |
+|-------|---------|
+| Todo mensaje marcado como procesado | Solo mensajes con contenido real |
+| Retry descartado como duplicado | Retry procesado correctamente |
+| Algunos mensajes nunca llegaban | Todos los mensajes llegan |
+
+---
+
 ## Commits Relacionados
 
 1. `d5fb4d7` - Add mutex and debounce to saveCreds
@@ -264,7 +372,8 @@ Esto indica:
 3. `156cdfc` - Add ev.process() for synchronous event handling
 4. `a908f2d` - Reuse existing token on session restoration
 5. `14888f1` - Remove key caching and add mutex for Signal key operations
-6. `PENDIENTE` - Unify all Signal operation mutexes (v2 fix)
+6. `1456d7e` - Unify all Signal operation mutexes (v2 fix)
+7. `e33843d` - Don't mark failed decryption messages as processed (v3 fix)
 
 ## Referencias
 
